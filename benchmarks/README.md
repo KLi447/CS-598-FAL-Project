@@ -3,7 +3,7 @@
 ## Experimental Setup
 
 * download the base model to the experimental platforms: [TinyLlama-1.1B](https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0) / [Llama2-7B](https://huggingface.co/meta-llama/Llama-2-7b-hf) / [Llama2-13B](https://huggingface.co/meta-llama/Llama-2-13b-hf) / [Llama2-70B](https://huggingface.co/meta-llama/Llama-2-70b-hf)
-* Follow the [Quickstart guide](https://github.com/TUDB-Labs/mLoRA?tab=readme-ov-file#quickstart) in README.md to install mLoRA (**NOTE**: before installation, switch to the reproduction branch by running `git checkout -b paper_reproduce`)
+* Follow the [Quickstart guide](https://github.com/TUDB-Labs/mLoRA?tab=readme-ov-file#quickstart) in README.md to install mLoRA (**NOTE**: before installation, switch to the reproduction branch by running `git fetch && git checkout -t origin/paper_reproduce`)
 * Follow the [Installation Guide](https://docs.nvidia.com/nsight-systems/InstallationGuide/index.html#) in nsight-systems documentation to install nsys tools for profiling BatchLoRA operator performance
 
 ## End-to-End Test
