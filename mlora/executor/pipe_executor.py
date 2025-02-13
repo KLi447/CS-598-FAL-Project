@@ -19,6 +19,7 @@ from .pipeline.function import RecvOperator, SendOperator
 from .pipeline.messages import PipeMessage, PipeMessageType
 from .pipeline.queue import DeviceSwapQueue
 from .pipeline.rpc_transport import RpcTransport
+from .pipeline.rpc_transport_block import RpcTransportBlock
 from .pipeline.stream import CudaStream
 from .task import Task
 
@@ -50,6 +51,8 @@ class PipeExecutor(Executor):
     backward_cache_: Dict[int, torch.Tensor]
     input_cache_: Dict[int, MLoRAData]
 
+    cache_forward_: torch.Tensor
+
     dispatcher_: PipeDispatcher
 
     def __init__(
@@ -61,6 +64,7 @@ class PipeExecutor(Executor):
         rank: int,
         balance: List[int],
         recompute: bool = False,
+        is_block: bool = False,
     ) -> None:
         self.model_ = model
         self.tokenizer_ = tokenizer
@@ -75,6 +79,8 @@ class PipeExecutor(Executor):
         self.backward_cache_ = {}
         self.input_cache_ = {}
 
+        self.cache_forward_ = None
+
         self.recompute_ = recompute
 
         self.__init_worker()
@@ -83,9 +89,14 @@ class PipeExecutor(Executor):
         # record the default stream to sync
         self.default_stream_ = CudaStream(torch.cuda.default_stream(self.device_))
         # init the rpc and wait the cluster node ready
-        self.transport_ = RpcTransport(
-            self.rank_, self.world_size_, torch.device(self.device_)
-        )
+        if is_block:
+            self.transport_ = RpcTransportBlock(
+                self.rank_, self.world_size_, torch.device(self.device_)
+            )
+        else:
+            self.transport_ = RpcTransport(
+                self.rank_, self.world_size_, torch.device(self.device_)
+            )
 
         self.dispatcher_: PipeDispatcher = cast(
             PipeDispatcher, DISPATCHER_CLASS["pipe"](config.dispatcher_)
@@ -177,7 +188,7 @@ class PipeExecutor(Executor):
         if message is None:
             return
 
-        logging.debug(
+        logging.info(
             f"Recv the gradients - {str(message.msg_id_)[:8]} from {message.src_}."
         )
 
@@ -191,7 +202,15 @@ class PipeExecutor(Executor):
 
         del self.backward_cache_[msg_id]
 
+        if self.cache_forward_ is not None:
+            self.cache_forward_.grad_fn.model_data_.communication_time_ = (
+                message.model_data_.communication_time_
+            )
+
         if self.role_ == WorkerRole.HEAD:
+            logging.info(
+                f"total time: {time.time() - message.model_data_.computation_time_} communication time: {message.model_data_.communication_time_}"
+            )
             self.__head_process_step(message)
         else:
             assert message.model_data_ is not None
@@ -206,7 +225,7 @@ class PipeExecutor(Executor):
         if message is None:
             return
 
-        logging.debug(
+        logging.info(
             f"Recv the activations - {str(message.msg_id_)[:8]} from {message.src_}."
         )
 
@@ -217,6 +236,9 @@ class PipeExecutor(Executor):
         # and then send it, so we hook the pre stage fn to poll the stream
         data.grad_fn.pre_stage_fn = self.default_stream_.poll  # type: ignore
         assert message.model_data_ is not None
+
+        self.cache_forward_ = data
+
         data = self.__forward(data, message.model_data_)
 
         self.default_stream_.poll()
@@ -292,6 +314,7 @@ class PipeExecutor(Executor):
             requires_grad=False,
         )
 
+        train_data.computation_time_ = time.time()
         hidden_data = self.__forward(tensor_data, train_data.model_data())
 
         # step2. then send the hidden state to next worker

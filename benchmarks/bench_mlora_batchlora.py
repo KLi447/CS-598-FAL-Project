@@ -22,9 +22,7 @@ g_total_token: int = 0
 
 
 g_batch_size: int = int(os.getenv("BATCH_SIZE"))
-g_lora_rank: int = int(os.getenv("LORA_RANK"))
 g_concurrency_num: int = int(os.getenv("TASK"))
-g_block_pp: bool = bool(os.getenv("BLOCK"))
 
 
 class BenchmarkArgs:
@@ -38,7 +36,7 @@ class BenchmarkConfig(mlora.config.MLoRAConfig):
     def __init__(self):
         # just for init
         self.dispatcher_ = DispatcherConfig(
-            {"name": "pipe", "concurrency_num": g_concurrency_num}
+            {"name": "default", "concurrency_num": g_concurrency_num}
         )
 
 
@@ -107,7 +105,6 @@ class BenchmarkTask(TrainTask):
 
 
 def generate_task_config(task_idx: int) -> TrainTaskConfig:
-    global g_lora_rank
 
     adapters = {
         f"test_{task_idx}": LoRAConfig(
@@ -115,7 +112,7 @@ def generate_task_config(task_idx: int) -> TrainTaskConfig:
                 "type": "lora",
                 "name": f"test_{task_idx}",
                 "path": f"adapters/test_{task_idx}",
-                "r": g_lora_rank,
+                "r": 16,
                 "alpha": 16,
                 "dropout": 0.05,
                 "target_modules": {
@@ -154,6 +151,7 @@ if __name__ == "__main__":
     mlora.utils.setup_seed(args.seed)
     mlora.utils.setup_logging(args.log_level, args.log_file)
     mlora.utils.setup_cuda_check()
+    mlora.utils.setup_metric_logger(args.metric_file)
 
     register_task_class("benchmark", BenchmarkTask)
 
@@ -166,20 +164,14 @@ if __name__ == "__main__":
     config = BenchmarkConfig()
 
     # init all task from config file
-    executor = mlora.executor.PipeExecutor(
+    executor = mlora.executor.Executor(
         model,
         tokenizer,
         config,
-        args.device,
-        args.rank,
-        args.balance,
-        args.recompute,
-        g_block_pp,
     )
 
     # only the header node can add task
-    if args.rank == 0:
-        for idx in range(0, g_concurrency_num):
-            executor.add_task(generate_task_config(idx))
+    for idx in range(0, g_concurrency_num):
+        executor.add_task(generate_task_config(idx))
 
     executor.execute()

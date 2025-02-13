@@ -10,14 +10,13 @@ import torch
 import torch.distributed.rpc
 
 from .messages import PipeMessage, PipeMessageType
-from .queue import DeviceSwapQueue
 from .transport import Transport
 
 # save by different message type
 # recv/send queue will automatically change the tensors' device
-RPCMessageRecvQueues: Dict[PipeMessageType, DeviceSwapQueue] = {}
+RPCMessageRecvQueues: Dict[PipeMessageType, queue.Queue] = {}
 
-RPCMessageSendQueues: Dict[PipeMessageType, DeviceSwapQueue] = {}
+RPCMessageSendQueues: Dict[PipeMessageType, queue.Queue] = {}
 
 RPCCOMMMessageRecvQueues: Dict[PipeMessageType, queue.Queue] = {}
 
@@ -49,7 +48,7 @@ def rpc_push_comm_queue(msg: PipeMessage) -> None:
 
 
 # rpc transport thread
-class RpcTransport(Transport):
+class RpcTransportBlock(Transport):
     rank_: int
     world_size_: int
     worker_device_: torch.device
@@ -64,10 +63,26 @@ class RpcTransport(Transport):
 
         self.stop_: bool = False
 
-        self.__init_device_swap_queue()
-        self.__init_comm_queue()
-        self.__init_background_thread()
+        self.__init_queue()
         self.__init_rpc()
+        self.__init_background_thread()
+
+    def __init_queue(self) -> None:
+        global RPCMessageSendQueues
+        for key in [PipeMessageType.ACTIVATIONS, PipeMessageType.GRADIENTS]:
+            RPCMessageSendQueues[key] = queue.Queue()
+
+        global RPCMessageRecvQueues
+        for key in [PipeMessageType.ACTIVATIONS, PipeMessageType.GRADIENTS]:
+            RPCMessageRecvQueues[key] = queue.Queue()
+
+        global RPCCOMMMessageSendQueues
+        for key in [PipeMessageType.COMM]:
+            RPCCOMMMessageSendQueues[key] = queue.Queue()
+
+        global RPCCOMMMessageRecvQueues
+        for key in [PipeMessageType.COMM]:
+            RPCCOMMMessageRecvQueues[key] = queue.Queue()
 
     def __init_rpc(self) -> None:
         if "MASTER_ADDR" not in os.environ:
@@ -86,62 +101,24 @@ class RpcTransport(Transport):
 
         logging.info(f"Init rpc with rank {self.rank_} world_size: {self.world_size_}")
 
-    def __init_device_swap_queue(self):
-        cpu_device = torch.device("cpu")
-
-        global RPCMessageSendQueues
-        for key in [PipeMessageType.ACTIVATIONS, PipeMessageType.GRADIENTS]:
-            RPCMessageSendQueues[key] = DeviceSwapQueue(
-                self.worker_device_, cpu_device, queue_name=f"{key.value}_send"
-            )
-            RPCMessageSendQueues[key].start()
-
-        global RPCMessageRecvQueues
-        for key in [PipeMessageType.ACTIVATIONS, PipeMessageType.GRADIENTS]:
-            RPCMessageRecvQueues[key] = DeviceSwapQueue(
-                cpu_device, self.worker_device_, queue_name=f"{key.value}_recv"
-            )
-            RPCMessageRecvQueues[key].start()
-
-    def __init_comm_queue(self):
-        global RPCCOMMMessageSendQueues
-        for key in [PipeMessageType.COMM]:
-            RPCCOMMMessageSendQueues[key] = queue.Queue()
-
-        global RPCCOMMMessageRecvQueues
-        for key in [PipeMessageType.COMM]:
-            RPCCOMMMessageRecvQueues[key] = queue.Queue()
-
-    def __init_background_thread(self):
-        self.gradients_send_thread_ = Thread(
-            target=self.__send_loop, args=(PipeMessageType.GRADIENTS,)
-        )
-        self.activations_send_thread_ = Thread(
-            target=self.__send_loop, args=(PipeMessageType.ACTIVATIONS,)
-        )
-        self.comm_send_thread_ = Thread(
-            target=self.__comm_send_loop, args=(PipeMessageType.COMM,)
-        )
-
-        self.gradients_send_thread_.start()
-        self.activations_send_thread_.start()
-        self.comm_send_thread_.start()
-
     def __send_loop(self, msg_type: PipeMessageType):
         global RPCMessageSendQueues
-        send_queue: DeviceSwapQueue = RPCMessageSendQueues[msg_type]
+        send_queue: queue.Queue = RPCMessageSendQueues[msg_type]
         assert send_queue is not None
 
         while not self.stop_ or not send_queue.empty():
-            msg = send_queue.get_waitime()
-            if msg is None:
+            try:
+                msg = send_queue.get(block=True, timeout=10)
+            except:
                 continue
+
             assert msg.tensor_data_ is not None
             assert msg.tensor_data_.device == torch.device("cpu")
             logging.debug(
                 f"RpcTransport async send the message: {str(msg.msg_id_)[:8]} "
                 f"to {msg.dst_}."
             )
+
             torch.distributed.rpc.rpc_async(
                 msg.dst_, rpc_push_device_swap_queue, args=(msg,)
             )
@@ -161,20 +138,25 @@ class RpcTransport(Transport):
                 f"RpcTransport async send the message: {str(msg.msg_id_)[:8]}"
                 f" to {msg.dst_}."
             )
+
             torch.distributed.rpc.rpc_async(msg.dst_, rpc_push_comm_queue, args=(msg,))
 
+    def __init_background_thread(self):
+        self.gradients_send_thread_ = Thread(
+            target=self.__send_loop, args=(PipeMessageType.GRADIENTS,)
+        )
+        self.activations_send_thread_ = Thread(
+            target=self.__send_loop, args=(PipeMessageType.ACTIVATIONS,)
+        )
+        self.comm_send_thread_ = Thread(
+            target=self.__comm_send_loop, args=(PipeMessageType.COMM,)
+        )
+
+        self.gradients_send_thread_.start()
+        self.activations_send_thread_.start()
+        self.comm_send_thread_.start()
+
     def __stop_send_loop(self):
-        global RPCMessageRecvQueues
-        global RPCMessageSendQueues
-
-        # first should stop the recv queue
-        for key in RPCMessageRecvQueues:
-            RPCMessageRecvQueues[key].stop()
-
-        # then stop the send queue
-        for key in RPCMessageSendQueues:
-            RPCMessageSendQueues[key].stop()
-
         self.stop_ = True
         self.activations_send_thread_.join()
         self.gradients_send_thread_.join()
@@ -194,12 +176,15 @@ class RpcTransport(Transport):
         global RPCMessageRecvQueues
 
         assert msg_type in RPCMessageRecvQueues
-        recv_queue: DeviceSwapQueue = RPCMessageRecvQueues[msg_type]
+        recv_queue: queue.Queue = RPCMessageRecvQueues[msg_type]
 
         if block:
-            msg = recv_queue.get()
+            msg: PipeMessage = recv_queue.get()
         else:
-            msg = recv_queue.get_nowait()
+            try:
+                msg: PipeMessage = recv_queue.get_nowait()
+            except:
+                msg = None
 
         if msg is not None:
             msg.tensor_data_ = msg.tensor_data_.to(self.worker_device_)
@@ -213,7 +198,6 @@ class RpcTransport(Transport):
                 recv_time - msg.model_data_.start_point_time_
             )
             logging.info(f"after total: {msg.model_data_.communication_time_}")
-
         return msg
 
     @override
@@ -228,7 +212,9 @@ class RpcTransport(Transport):
             f"send time[{msg.model_data_.random_id_ % 100000}]: {msg.model_data_.start_point_time_}"
         )
 
-        send_queue: DeviceSwapQueue = RPCMessageSendQueues[msg.msg_type_]
+        msg.tensor_data_ = msg.tensor_data_.to("cpu")
+
+        send_queue: queue.Queue = RPCMessageSendQueues[msg.msg_type_]
         send_queue.put(msg)
 
     @override
