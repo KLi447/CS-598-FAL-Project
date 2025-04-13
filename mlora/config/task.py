@@ -43,6 +43,7 @@ class TrainTaskConfig(TaskConfig):
     num_epochs_: int
     cutoff_len_: int
     save_step_: int
+    compute_cost_: float
 
     __params_map: Dict[str, str] = {
         "batch_size_": "batch_size",
@@ -66,6 +67,16 @@ class TrainTaskConfig(TaskConfig):
         self.num_epochs_ = int(self.num_epochs_)
         self.cutoff_len_ = int(self.cutoff_len_)
         self.save_step_ = int(self.save_step_)
+
+        adapter_name = config["adapter"]
+        adapter_conf = adapters[adapter_name]
+        if adapter_conf.type_ == "flora_per_example":
+            r = adapter_conf.rank_
+            # maybe cost = r * batch_size or something
+            self.compute_cost_ = r * float(self.batch_size_)
+        else:
+            self.compute_cost_ = float(self.batch_size_)
+
 
         assert self.mini_batch_size_ <= self.batch_size_
         assert self.batch_size_ % self.mini_batch_size_ == 0

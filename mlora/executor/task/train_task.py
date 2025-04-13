@@ -48,6 +48,43 @@ class TrainTask(Task):
         self._pre_recover_context()
         self._pre_dataset()
 
+        # --- Begin: New per-example adapter preparation ---
+        # Check if this task's adapter type is 'flora_per_example'
+        if self.adapter_config_.type == "flora_per_example":
+            # Extract parameters from adapter config
+            in_dim = self.adapter_config_.in_dim_
+            out_dim = self.adapter_config_.out_dim_
+            r = self.adapter_config_.rank_
+            batch_size = self.adapter_config_.batch_size_
+            drop = self.adapter_config_.dropout_
+
+            from mlora.model.modules.flora_per_example import FFloraPerExampleAdapter
+            flora_adapter = FFloraPerExampleAdapter(
+                adapter_name=self.adapter_config_.name_,
+                batch_size=batch_size,
+                in_dim=in_dim,
+                out_dim=out_dim,
+                r=r,
+                device="cpu"  # or your preferred device
+            )
+
+            # Load custom adapter matrices if provided
+            if self.adapter_config_.B_init_file_ != "":
+                b_init = torch.load(self.adapter_config_.B_init_file_)
+            else:
+                b_init = None
+            if self.adapter_config_.A_init_file_ != "":
+                a_init = torch.load(self.adapter_config_.A_init_file_)
+            else:
+                a_init = None
+
+            if b_init is not None or a_init is not None:
+                flora_adapter.init_weight(b_init, a_init)
+            
+            # Attach the adapter to this task.
+            self._adapter_ = flora_adapter
+        
+
     def _get_recover_dir(self) -> str | None:
         if not os.path.isdir(self.context_.path_):
             return None

@@ -18,7 +18,8 @@ from mlora.prompter import Prompter, PrompterFactory
 
 class Task:
     config_: TaskConfig
-
+    adapter_config_: TaskConfig  # This field stores the adapter-related settings.
+    
     prompter_: Prompter
     tokenizer_: Tokenizer
 
@@ -37,7 +38,7 @@ class Task:
 
     def __init__(self, config: TaskConfig, llm_name: str) -> None:
         self.config_ = config
-
+        self.adapter_config_ = config.adapter_
         self.data_ = []
         self.now_data_idx_ = 0
         self.now_step_ = 1

@@ -53,6 +53,57 @@ class AdapterConfig(DictConfig):
     @abstractmethod
     def export(self) -> Dict[str, str]: ...
 
+class FloraPerExampleConfig(DictConfig):
+    """
+    Config class for the per-example Fast LoRA adapter.
+    This reads fields like rank, in_dim, out_dim, batch_size, etc.
+    Also reads optional B_init_file, A_init_file.
+    """
+    type_: str
+    name_: str
+    path_: str
+
+    in_dim_: int
+    out_dim_: int
+    rank_: int
+    batch_size_: int
+    dropout_: float
+
+    optimizer_: str      # e.g., "adamw"
+    lr_: float           # learning rate
+    alpha_: int          # used for scaling in LoRA
+
+    B_init_file_: str
+    A_init_file_: str
+
+    __params_map: Dict[str, str] = {
+        "type_": "type",
+        "name_": "name",
+        "path_": "path",
+        "in_dim_": "in_dim",
+        "out_dim_": "out_dim",
+        "rank_": "rank",
+        "batch_size_": "batch_size",
+        "dropout_": "dropout",
+        "optimizer_": "optimizer",
+        "lr_": "lr",
+        "alpha_": "alpha",
+        "B_init_file_": "B_init_file",
+        "A_init_file_": "A_init_file"
+    }
+
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self.init(self.__params_map, config)
+        # Ensure types are correct:
+        self.in_dim_ = int(self.in_dim_)
+        self.out_dim_ = int(self.out_dim_)
+        self.rank_ = int(self.rank_)
+        self.batch_size_ = int(self.batch_size_)
+        self.dropout_ = float(self.dropout_)
+        self.lr_ = float(self.lr_)
+        self.alpha_ = int(self.alpha_)
+        logging.info(f"FloraPerExample adapter config: {self.__dict__}")
 
 class LoRAConfig(AdapterConfig):
     r_: int
@@ -89,6 +140,8 @@ class LoRAConfig(AdapterConfig):
             "bias": "none",
             "target_modules": [key for key in self.target_ if self.target_[key]],
         }
+
+
 
 
 class LoRAPlusConfig(LoRAConfig):
@@ -143,4 +196,5 @@ ADAPTERCONFIG_CLASS = {
     "loraplus": LoRAPlusConfig,
     "vera": VeRAConfig,
     "dora": DoRAConfig,
+    "flora_per_example": FloraPerExampleConfig,
 }

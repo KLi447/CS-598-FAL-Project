@@ -16,7 +16,7 @@ from .adapter import Adapter
 from .dora import DoRA
 from .lora import LoRA, LoRAFunction, get_range_tensor
 from .vera import VeRA
-
+from .flora_per_example import FFloraPerExampleAdapter
 
 class Linear(torch.nn.Module):
     def __init__(self, weight: torch.nn.Module):
@@ -49,6 +49,7 @@ class Linear(torch.nn.Module):
             self.__lora_forward,
             self.__vera_forward,
             self.__dora_forward,
+            self.__flora_per_example_forward,
         ]
 
         for func in adapter_func_list:
@@ -172,6 +173,35 @@ class Linear(torch.nn.Module):
 
         set_backward_tracepoint(result.grad_fn, "b_dora")
 
+        return result
+
+    def __flora_per_example_forward(
+        self, data: torch.Tensor, input_args: ModelData, result: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        If we have a per-example fFlora adapter, call its forward_per_example().
+        We'll do a check for that type of adapter in self.adapters_.
+        """
+        # If there's no adapter of type "flora_per_example", do nothing
+        for lora_config in input_args.data_config_:
+            adapter_name = lora_config.adapter_name_
+            if adapter_name not in self.adapters_:
+                continue
+            adapter = self.adapters_[adapter_name]
+            if adapter.adapter_type_ != "flora_per_example":
+                continue
+
+            if data.dim() == 2:
+                data = data.unsqueeze(1)
+
+            W0 = self.weight_.weight  # shape [out_dim, in_dim]
+            W0_t = W0.transpose(0,1)  # shape [in_dim, out_dim]
+
+            out = adapter.forward_per_example(data, W0_t)
+            # shape => [batch_size, seq_len, out_dim]
+
+            # we override "result" 
+            result = out
         return result
 
     def load_adapter(self, adapter: Adapter):
