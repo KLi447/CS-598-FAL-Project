@@ -8,6 +8,7 @@ import torch
 
 from mlora.config import MLoRAConfig
 from mlora.config.task import TaskConfig
+from mlora.config.config import DictConfig
 from mlora.model.args import LinearInfo, MLoRAData, ModelData
 from mlora.model.llm import LLMModel
 from mlora.model.llm.model_llama import precompute_mask
@@ -35,13 +36,14 @@ class PipeExecutor(Executor):
 
     rank_: int
     world_size_: int
-    balance_: List[int]
+    # balance_: List[int]
 
     # info about model
     partial_model_: torch.nn.Sequential
     heads_: int
     model_name_: str
     recompute_: bool
+    mlora_config: DictConfig
 
     input_queue_: DeviceSwapQueue
     transport_: RpcTransport
@@ -59,18 +61,18 @@ class PipeExecutor(Executor):
         config: MLoRAConfig,
         device: str,
         rank: int,
-        balance: List[int],
+        nodes: int,
         recompute: bool = False,
     ) -> None:
         self.model_ = model
         self.tokenizer_ = tokenizer
         self.heads_ = self.model_.n_heads_
         self.model_name_ = self.model_.name_or_path_
+        self.mlora_config = config
 
         self.device_ = device
         self.rank_ = rank
-        self.balance_ = balance
-        self.world_size_ = len(balance)
+        self.world_size_ = nodes
 
         self.backward_cache_ = {}
         self.input_cache_ = {}
@@ -116,26 +118,32 @@ class PipeExecutor(Executor):
             self.role_ = WorkerRole.MID
 
     def __init_partition(self) -> None:
-        balance = self.balance_[self.rank_]
-        start_module_idx = sum(self.balance_[: self.rank_])
-        end_module_idx = start_module_idx + balance
+        seq_model: torch.nn.Sequential = self.model_.sequential()
+
+        balance = [len(seq_model) // self.world_size_] * self.world_size_
+        for i in range(len(seq_model) % self.world_size_):
+            balance[i] += 1 # LLMs are homogenous, add wherever (for now)
+
+        start_module_idx = sum(balance[: self.rank_])
+        end_module_idx = start_module_idx + balance[self.rank_]
+
+        assert sum(balance) == len(seq_model) # otherwise I've done some math wrong :/
+
+        self.partial_model_ = torch.nn.Sequential()
+
         logging.info(
             f"RANK-{self.rank_} in device {self.device_} to load module layers "
             f"from {start_module_idx} to {end_module_idx}."
         )
 
-        seq_model: torch.nn.Sequential = self.model_.sequential()
-        assert sum(self.balance_) == len(seq_model)
-
-        self.partial_model_ = torch.nn.Sequential()
-
         for idx in range(start_module_idx, end_module_idx):
             self.partial_model_.append(seq_model[idx])
 
-        assert len(self.partial_model_) == balance
+        assert len(self.partial_model_) == balance[self.rank_]
 
         del seq_model[:start_module_idx]
-        del seq_model[balance:]
+        if end_module_idx < sum(balance) - 1:
+            del seq_model[end_module_idx+1:]
         del self.model_
 
         torch.cuda.empty_cache()
