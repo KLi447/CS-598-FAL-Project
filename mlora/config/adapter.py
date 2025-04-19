@@ -53,7 +53,7 @@ class AdapterConfig(DictConfig):
     @abstractmethod
     def export(self) -> Dict[str, str]: ...
 
-class FloraPerExampleConfig(DictConfig):
+class FloraPerExampleConfig(AdapterConfig):
     """
     Config class for the per-example Fast LoRA adapter.
     This reads fields like rank, in_dim, out_dim, batch_size, etc.
@@ -75,6 +75,7 @@ class FloraPerExampleConfig(DictConfig):
 
     B_init_file_: str
     A_init_file_: str
+    shared_: bool
 
     __params_map: Dict[str, str] = {
         "type_": "type",
@@ -89,7 +90,9 @@ class FloraPerExampleConfig(DictConfig):
         "lr_": "lr",
         "alpha_": "alpha",
         "B_init_file_": "B_init_file",
-        "A_init_file_": "A_init_file"
+        "A_init_file_": "A_init_file",
+        "shared_":"shared",
+        "target_": "target_modules",
     }
 
     def __init__(self, config: dict):
@@ -103,7 +106,23 @@ class FloraPerExampleConfig(DictConfig):
         self.dropout_ = float(self.dropout_)
         self.lr_ = float(self.lr_)
         self.alpha_ = int(self.alpha_)
+        self.shared_ = bool(self.shared_)
+        for key, value in self.target_.items():
+            self.target_[key] = bool(value)
         logging.info(f"FloraPerExample adapter config: {self.__dict__}")
+
+    def export(self) -> Dict[str, object]:
+        return {
+            "peft_type":    "FLORA_PER_EXAMPLE",
+            "rank":         self.rank_,
+            "alpha":        self.alpha_,
+            "dropout":      self.dropout_,
+            "batch_size":   self.batch_size_,
+            "in_dim":       self.in_dim_,
+            "out_dim":      self.out_dim_,
+            "shared":       self.shared_,
+            "target_modules": [key for key in self.target_ if self.target_[key]],
+        }
 
 class LoRAConfig(AdapterConfig):
     r_: int

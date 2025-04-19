@@ -1,3 +1,5 @@
+# File: mlora/model/modules/linear.py
+
 from typing import Callable, List, MutableMapping, Optional, Tuple
 
 import torch
@@ -18,10 +20,10 @@ from .lora import LoRA, LoRAFunction, get_range_tensor
 from .vera import VeRA
 from .flora_per_example import FFloraPerExampleAdapter
 
+
 class Linear(torch.nn.Module):
     def __init__(self, weight: torch.nn.Module):
-        # the weight just wrapper the module from LlamaForCausalLM
-        # the name for debug
+        # wrap the actual Llama Linear or bitsandbytes Linear4/8bitLt
         super().__init__()
 
         if not isinstance(weight, torch.nn.Linear):
@@ -31,28 +33,27 @@ class Linear(torch.nn.Module):
         else:
             weight.requires_grad_(False)
 
-        self.device_ = weight.weight.device
-        self.weight_ = weight
+        self.device_   = weight.weight.device
+        self.weight_   = weight
         self.adapters_: MutableMapping[str, Adapter] = {}
 
     def forward(self, data: torch.Tensor, input_args: ModelData) -> torch.Tensor:
-        # data shape is: batch_size * max_seq_len * dim
-        # result = data @ self.weight_.transpose(0, 1)
+        # data: [batch*seq_len, dim]  or  [batch, seq_len, dim]
         if len(self.adapters_) == 0:
             return self.weight_.forward(data)
 
+        # base pass
         with nvtx_range("f_linear"):
             result = self.weight_.forward(data)
         set_backward_tracepoint(result.grad_fn, "b_linear")
 
-        adapter_func_list: List[Callable] = [
+        # sequence of adapter hooks
+        for func in (
             self.__lora_forward,
             self.__vera_forward,
             self.__dora_forward,
             self.__flora_per_example_forward,
-        ]
-
-        for func in adapter_func_list:
+        ):
             result = func(data, input_args, result)
 
         return result
@@ -60,148 +61,132 @@ class Linear(torch.nn.Module):
     def __lora_forward(
         self, data: torch.Tensor, input_args: ModelData, result: torch.Tensor
     ) -> torch.Tensor:
-        # split the data and result
         dropouts: List[Optional[float]] = []
         scalings: List[Optional[float]] = []
         loras: Tuple[torch.Tensor | None, ...] = ()
 
-        for lora_config in input_args.data_config_:
-            adapter_name = lora_config.adapter_name_
-
-            if adapter_name not in self.adapters_ or not isinstance(
-                self.adapters_[adapter_name], LoRA
+        for cfg in input_args.data_config_:
+            name = cfg.adapter_name_
+            if name not in self.adapters_ or not isinstance(
+                self.adapters_[name], LoRA
             ):
                 loras += (None, None)
                 dropouts.append(None)
                 scalings.append(None)
                 continue
 
-            loras += (
-                self.adapters_[adapter_name].lora_a_,
-                self.adapters_[adapter_name].lora_b_,
-            )
-            dropouts.append(self.adapters_[adapter_name].dropout_)
-            scalings.append(self.adapters_[adapter_name].scaling_)
+            adapter = self.adapters_[name]
+            loras += (adapter.lora_a_, adapter.lora_b_)
+            dropouts.append(adapter.dropout_)
+            scalings.append(adapter.scaling_)
 
         with nvtx_range("f_lora"):
             result = LoRAFunction.apply(
                 result, data, input_args, dropouts, scalings, *loras
             )
         set_backward_tracepoint(result.grad_fn, "b_lora")
-
         return result
 
     def __vera_forward(
         self, data: torch.Tensor, input_args: ModelData, result: torch.Tensor
     ) -> torch.Tensor:
         lora_range = get_range_tensor(data.device, data.shape[0])
-
-        for lora_config in input_args.data_config_:
-            adapter_name = lora_config.adapter_name_
-
-            if adapter_name not in self.adapters_ or not isinstance(
-                self.adapters_[adapter_name], VeRA
+        for cfg in input_args.data_config_:
+            name = cfg.adapter_name_
+            if name not in self.adapters_ or not isinstance(
+                self.adapters_[name], VeRA
             ):
                 continue
 
-            adapter = self.adapters_[adapter_name]
-
-            start_idx = lora_config.batch_start_idx_
-            end_idx = lora_config.batch_end_idx_
+            adapter = self.adapters_[name]
+            start, end = cfg.batch_start_idx_, cfg.batch_end_idx_
 
             with nvtx_range("f_vera"):
-                lora_data = F.dropout(
-                    data[start_idx:end_idx],
-                    p=adapter.dropout_,
-                    training=True,
-                    inplace=False,
-                )
-                lora_data = lora_data.mul(adapter.scaling_)
-                lora_data = lora_data @ adapter.lora_a_.transpose(0, 1)
-                lora_data = lora_data * adapter.d_vec_
-                lora_data = lora_data @ adapter.lora_b_.transpose(0, 1)
-                lora_data = lora_data * adapter.b_vec_
-                lora_data = lora_data.to(result.dtype)
+                part = data[start:end]
+                part = F.dropout(part, p=adapter.dropout_, training=True)
+                part = part.mul(adapter.scaling_)
+                part = part @ adapter.lora_a_.T
+                part = part * adapter.d_vec_
+                part = part @ adapter.lora_b_.T
+                part = part * adapter.b_vec_
+                part = part.to(result.dtype)
 
                 result = result.index_add(
-                    dim=0, index=lora_range[start_idx:end_idx], source=lora_data
+                    dim=0, index=lora_range[start:end], source=part
                 )
 
         set_backward_tracepoint(result.grad_fn, "b_vera")
-
         return result
 
     def __dora_forward(
         self, data: torch.Tensor, input_args: ModelData, result: torch.Tensor
     ) -> torch.Tensor:
         lora_range = get_range_tensor(data.device, data.shape[0])
-
-        for lora_config in input_args.data_config_:
-            adapter_name = lora_config.adapter_name_
-
-            if adapter_name not in self.adapters_ or not isinstance(
-                self.adapters_[adapter_name], DoRA
+        for cfg in input_args.data_config_:
+            name = cfg.adapter_name_
+            if name not in self.adapters_ or not isinstance(
+                self.adapters_[name], DoRA
             ):
                 continue
 
-            adapter = self.adapters_[adapter_name]
-
-            start_idx = lora_config.batch_start_idx_
-            end_idx = lora_config.batch_end_idx_
+            adapter = self.adapters_[name]
+            start, end = cfg.batch_start_idx_, cfg.batch_end_idx_
 
             with nvtx_range("f_dora"):
-                weight_norm = adapter.get_weight_norm()
+                weight_norm   = adapter.get_weight_norm()
                 mag_norm_scale = (adapter.magnitude_ / weight_norm).view(1, -1)
 
-                dora_data = F.dropout(
-                    data[start_idx:end_idx],
-                    p=adapter.dropout_,
-                    training=True,
-                    inplace=False,
-                )
-                lora_result = dora_data @ adapter.lora_a_.transpose(0, 1)
-                lora_result = lora_result @ adapter.lora_b_.transpose(0, 1)
-                lora_result = mag_norm_scale * lora_result * adapter.scaling_
+                part = data[start:end]
+                part = F.dropout(part, p=adapter.dropout_, training=True)
+                part = part @ adapter.lora_a_.T
+                part = part @ adapter.lora_b_.T
+                part = mag_norm_scale * part * adapter.scaling_
 
-                base_result = (
-                    result[start_idx:end_idx] * (mag_norm_scale - 1) + lora_result
-                )
-
+                base = result[start:end] * (mag_norm_scale - 1) + part
                 result = result.index_copy(
-                    dim=0, index=lora_range[start_idx:end_idx], source=base_result
+                    dim=0, index=lora_range[start:end], source=base
                 )
 
         set_backward_tracepoint(result.grad_fn, "b_dora")
-
         return result
 
     def __flora_per_example_forward(
         self, data: torch.Tensor, input_args: ModelData, result: torch.Tensor
     ) -> torch.Tensor:
         """
-        If we have a per-example fFlora adapter, call its forward_per_example().
-        We'll do a check for that type of adapter in self.adapters_.
+        Fast‑LoRA per‑example path. Must return a [B, S, C] tensor just like `result`
+        so the decoder’s residual add will work.
         """
-        # If there's no adapter of type "flora_per_example", do nothing
-        for lora_config in input_args.data_config_:
-            adapter_name = lora_config.adapter_name_
-            if adapter_name not in self.adapters_:
+        # Find the adapter of type "flora_per_example"
+        for cfg in input_args.data_config_:
+            name = cfg.adapter_name_
+            if name not in self.adapters_:
                 continue
-            adapter = self.adapters_[adapter_name]
+            adapter = self.adapters_[name]
             if adapter.adapter_type_ != "flora_per_example":
                 continue
 
             if data.dim() == 2:
-                data = data.unsqueeze(1)
+                # [B*S, d] → [B, S, d]
+                BS, d    = data.shape
+                S        = input_args["seq_len"]
+                B        = BS // S
+                data3d   = data.view(B, S, d)
+            else:
+                # already [B, S, d]
+                B, S, d  = data.shape
+                data3d   = data
 
-            W0 = self.weight_.weight  # shape [out_dim, in_dim]
-            W0_t = W0.transpose(0,1)  # shape [in_dim, out_dim]
+            # W0: original Llama weight of shape [out_dim, in_dim]
+            W0 = self.weight_.weight
+            W0_t = W0.transpose(0,1)                   # [in_dim, out_dim]
 
-            out = adapter.forward_per_example(data, W0_t)
-            # shape => [batch_size, seq_len, out_dim]
+            # Run our adapter: returns [B, S, out_dim]
+            out3d = adapter.forward_per_example(data3d, W0_t)
 
-            # we override "result" 
-            result = out
+            # **DO NOT** flatten back to 2D.  Return the 3D tensor:
+            result = out3d.to(result.dtype)
+
         return result
 
     def load_adapter(self, adapter: Adapter):
@@ -209,7 +194,5 @@ class Linear(torch.nn.Module):
         self.adapters_[adapter.adapter_name_] = adapter
 
     def offload_adapter(self, adapter_name: str):
-        if adapter_name not in self.adapters_:
-            return
-
-        del self.adapters_[adapter_name]
+        if adapter_name in self.adapters_:
+            del self.adapters_[adapter_name]

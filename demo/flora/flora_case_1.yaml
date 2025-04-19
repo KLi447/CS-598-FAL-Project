@@ -33,11 +33,37 @@ adapters:
     rank: 8
     batch_size: 16
     optimizer: "adamw"
-    lr: 3e-4
+    lr: 24e-4
     alpha: 64
     dropout: 0.05
     B_init_file: ""
     A_init_file: ""
+    shared: true
+    target_modules:
+      q_proj: true
+      k_proj: true
+      v_proj: true
+      o_proj: false
+
+  - name: "flora_pe_1"
+    type: "flora_per_example"
+    path: "adapters/flora_pe_1"
+    in_dim: 768
+    out_dim: 768
+    rank: 16
+    batch_size: 16
+    optimizer: "adamw"
+    lr: 24e-4
+    alpha: 64
+    dropout: 0.05
+    B_init_file: ""
+    A_init_file: ""
+    shared: true
+    target_modules:
+      q_proj: true
+      k_proj: true
+      v_proj: true
+      o_proj: true
 
 
 tasks:
@@ -54,6 +80,17 @@ tasks:
   - type: "train"
     name: "task_fast"
     adapter: "flora_pe_0"
+    dataset: "data"
+    batch_size: 16
+    mini_batch_size: 16
+    num_epochs: 5
+    cutoff_len: 256
+    save_step: 2000
+
+
+  - type: "train"
+    name: "task_fast_2"
+    adapter: "flora_pe_1"
     dataset: "data"
     batch_size: 16
     mini_batch_size: 16

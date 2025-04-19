@@ -20,13 +20,13 @@ if __name__ == "__main__":
     config = mlora.config.MLoRAConfig(args.config)
 
     if args.fast_lora:
-        logging.info("Using fast (per-example) LoRA mode as specified.")
+        print("Using fast (per-example) LoRA mode as specified.")
         for adapter_name, adapter_conf in config.adapters.items():
             if adapter_conf.type_ == "lora":
                 # If desired, override normal LoRA adapters to fast mode.
                 adapter_conf.type_ = "flora_per_example"
     else:
-        logging.info("Using standard LoRA mode.")
+        print("Using standard LoRA mode.")
 
     executor = mlora.executor.PipeExecutor(
         model, tokenizer, config, args.device, args.rank, args.balance, args.recompute

@@ -23,7 +23,7 @@ class PipeDispatcher(BackendDispatcher):
         for task in terminate_task:
             self.terminate_event_.notify(task)
 
-        self.ready_.sort(key=lambda t: t.config_.compute_cost, reverse=True)
+        self.ready_.sort(key=lambda t: t.config_.compute_cost_, reverse=True)
 
         # pipeline only have one running task
         while len(self.running_) <= self.concurrency_num_ and len(self.ready_) > 0:

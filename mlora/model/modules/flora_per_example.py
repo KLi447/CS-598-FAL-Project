@@ -1,26 +1,24 @@
 # File: mlora/model/modules/flora_per_example.py
+# Fast‑LoRA per‑example adapter (shared & non‑shared)
 
+from __future__ import annotations
 import math
+from typing import List, Optional
+import logging
 import torch
 import torch.nn.functional as F
-from typing import Optional, List
+from mlora.model.modules.adapter import Adapter
 
-from mlora.model.modules.adapter import Adapter  # <-- Inherit from here
 
 class FFloraPerExampleAdapter(Adapter):
     """
-    Per-example Fast LoRA adapter, inheriting from the base "Adapter" class.
+    Fast‑LoRA adapter that supports
 
-    Instead of having a single [in_dim, r] / [r, out_dim] for an entire domain,
-    we store a separate B_i and A_i for each example i in the batch:
-      B_all has shape [batch_size, in_dim, r]
-      A_all has shape [batch_size, r, out_dim]
-
-    Then we do eq. (6) from the "Batched Low-Rank Adaptation" paper:
-      Y = A_i ∘ ( (B_i ∘ X_i) W0 )
-    for each example i, all in one pass.
+        shared=True   – one (B, A) pair for the whole batch
+        shared=False  – distinct (Bᵢ, Aᵢ) for each example
     """
 
+    # ────────────────────────────────────────────────────────────
     def __init__(
         self,
         adapter_name: str,
@@ -28,131 +26,109 @@ class FFloraPerExampleAdapter(Adapter):
         in_dim: int,
         out_dim: int,
         r: int,
+        *,
         device: torch.device = torch.device("cpu"),
-        activation_fn = None,
+        activation_fn=None,
         optimizer: str = "adamw",
         lr: float = 3e-4,
         alpha: int = 64,
         dropout: float = 0.0,
+        shared: bool = False,
     ):
-        # Call the base Adapter constructor
         super().__init__("flora_per_example", adapter_name)
 
         self.batch_size_ = batch_size
-        self.in_dim_ = in_dim
-        self.out_dim_ = out_dim
-        self.r_ = r
-        self.device_ = device
-        self.activation_ = activation_fn
+        self.in_dim_     = in_dim
+        self.out_dim_    = out_dim
+        self.r_          = r
+        self.shared_     = shared
+        self.device_     = device
+        self.act_        = activation_fn
+        self.scaling_    = alpha / float(r)
+        self.dropout_    = dropout
+        
+        if self.shared_:
+            logging.info(
+                "shared now"
+            )
+            self.B = torch.empty(in_dim, r, device=device, requires_grad=True)
+            self.A = torch.empty(r,      out_dim, device=device, requires_grad=True)
+            self._kaiming_(self.B)
+            self._kaiming_(self.A)
+        else:
+            logging.info(
+                "not shared now"
+            )
+            self.B_all = torch.empty(
+                batch_size, in_dim, r, device=device, requires_grad=True
+            )
+            self.A_all = torch.empty(
+                batch_size, r, out_dim, device=device, requires_grad=True
+            )
+            self._kaiming_(self.B_all)
+            self._kaiming_(self.A_all)
 
-        self.optimizer_ = optimizer
-        self.lr_ = lr
-        self.alpha_ = alpha
-        self.dropout_ = dropout
+    # ────────────────────────────────────────────────────────────
+    @staticmethod
+    def _kaiming_(t: torch.Tensor):
+        torch.nn.init.kaiming_normal_(t, a=math.sqrt(5))
 
-        # Compute scaling factor (commonly alpha / r)
-        self.scaling_ = self.alpha_ / float(self.r_)
-
-        # Store B_i and A_i for each example i
-        self.B_all = torch.zeros(
-            (batch_size, in_dim, r),
-            dtype=torch.float32,
-            device=device,
-            requires_grad=True
-        )
-        self.A_all = torch.zeros(
-            (batch_size, r, out_dim),
-            dtype=torch.float32,
-            device=device,
-            requires_grad=True
-        )
-
-        # Optionally init them (kaiming)
-        self.init_weight()
-
+    # ----- hooks required by the framework ----------------------
     def init_weight(
         self,
         B_init: Optional[torch.Tensor] = None,
-        A_init: Optional[torch.Tensor] = None
+        A_init: Optional[torch.Tensor] = None,
     ):
         """
-        Initialize each example's B_i, A_i either from user-provided Tensors or
-        with Kaiming normal.
+        Optional warm‑start called by TrainFloraPerExampleContext
         """
-        with torch.no_grad():
-            if B_init is not None:
-                assert B_init.shape == self.B_all.shape
-                self.B_all.copy_(B_init)
+        if B_init is not None:
+            if self.shared_:
+                self.B.data.copy_(B_init.to(self.B))
             else:
-                for i in range(self.batch_size_):
-                    torch.nn.init.kaiming_normal_(self.B_all[i], a=math.sqrt(5))
+                self.B_all.data.copy_(B_init.to(self.B_all))
 
-            if A_init is not None:
-                assert A_init.shape == self.A_all.shape
-                self.A_all.copy_(A_init)
+        if A_init is not None:
+            if self.shared_:
+                self.A.data.copy_(A_init.to(self.A))
             else:
-                for i in range(self.batch_size_):
-                    torch.nn.init.kaiming_normal_(self.A_all[i], a=math.sqrt(5))
+                self.A_all.data.copy_(A_init.to(self.A_all))
 
-    ############################################################################
-    # Implementation for Adapter base class
-    ############################################################################
     def get_trainable_tensors(self) -> List[torch.Tensor]:
-        # Return the per-example adapter weights that can be learned.
-        return [self.B_all, self.A_all]
+        return [self.B, self.A] if self.shared_ else [self.B_all, self.A_all]
 
     def get_all_tensors(self) -> List[torch.Tensor]:
-        # Same as trainable for now. If there were non-trainable data, we'd add it.
-        return [self.B_all, self.A_all]
+        return self.get_trainable_tensors()
 
     def disable_grad(self):
-        for t in self.get_trainable_tensors():
-            t.requires_grad_(False)
+        for p in self.get_trainable_tensors():
+            p.requires_grad_(False)
 
     def enable_grad(self):
-        for t in self.get_trainable_tensors():
-            t.requires_grad_(True)
+        for p in self.get_trainable_tensors():
+            p.requires_grad_(True)
 
-    ############################################################################
-    # The core forward pass for eq. (6):
-    ############################################################################
+    # ------------------------------------------------------------
     def forward_per_example(self, X: torch.Tensor, W0: torch.Tensor) -> torch.Tensor:
         """
-        X: shape [batch_size, seq_len, in_dim]
-        W0: shape [in_dim, out_dim]
-        Return: shape [batch_size, seq_len, out_dim]
+        X  : [B, S, in_dim]
+        W0 : [in_dim, out_dim]  (frozen base weight)
         """
-        B, seq_len, in_dim = X.shape
-        assert B == self.batch_size_
-        assert in_dim == self.in_dim_
+        B_sz, S, _ = X.shape
+        if not self.shared_ and B_sz != self.batch_size_:
+            raise ValueError("Batch‑size mismatch with non‑shared adapter")
 
-        # (B_i ∘ X_i)
-        X_4d = X.unsqueeze(-1)          # [B, seq_len, in_dim, 1]
-        B_4d = self.B_all.unsqueeze(1)  # [B, 1, in_dim, r]
-        BX_4d = X_4d * B_4d             # [B, seq_len, in_dim, r]
+        if self.shared_:
+            # shared (B,A)
+            BX  = X.unsqueeze(-1) * self.B                     # [B,S,in_dim,r]
+            out = torch.einsum("bsir,io->bsro", BX, W0) * self.A   # [B,S,r,o]
+        else:
+            B = self.B_all.unsqueeze(1)                         # [B,1,in_dim,r]
+            A = self.A_all.unsqueeze(1)                         # [B,1,r,o]
+            BX = X.unsqueeze(-1) * B                            # [B,S,in_dim,r]
+            out = torch.einsum("bsir,io->bsro", BX, W0) * A
 
-        # multiply by W0 => shape [in_dim, out_dim]
-        # Flatten to do matmul in a single pass
-        BX_3d = BX_4d.view(B * seq_len, in_dim, self.r_)
-
-        tmp = torch.einsum("bir,io->bro", BX_3d, W0)  # => [B*seq_len, r, out_dim]
-
-        # multiply by A_i
-        # A_all: [B, r, out_dim], replicate each example across seq_len
-        A_expanded = self.A_all.unsqueeze(1).expand(B, seq_len, self.r_, self.out_dim_)
-        A_3d = A_expanded.contiguous().view(B * seq_len, self.r_, self.out_dim_)
-
-        # => [B*seq_len, r, out_dim]
-        out_3d = tmp * A_3d  
-
-        # reduce across r dimension (mean)
-        out_2d = out_3d.mean(dim=1)  # => [B*seq_len, out_dim]
-
-        # reshape => [B, seq_len, out_dim]
-        Y = out_2d.view(B, seq_len, self.out_dim_)
-
-        # optional activation
-        if self.activation_ is not None:
-            Y = self.activation_(Y)
-
+        Y = out.sum(dim=2).mul(self.scaling_)
+        if self.act_ is not None:
+            Y = self.act_(Y)
         return Y

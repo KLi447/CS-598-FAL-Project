@@ -50,7 +50,7 @@ class TrainTask(Task):
 
         # --- Begin: New per-example adapter preparation ---
         # Check if this task's adapter type is 'flora_per_example'
-        if self.adapter_config_.type == "flora_per_example":
+        if self.adapter_config_.type_ == "flora_per_example":
             # Extract parameters from adapter config
             in_dim = self.adapter_config_.in_dim_
             out_dim = self.adapter_config_.out_dim_
