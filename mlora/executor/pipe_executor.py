@@ -54,6 +54,8 @@ class PipeExecutor(Executor):
     cache_forward_: torch.Tensor
 
     dispatcher_: PipeDispatcher
+    
+    should_terminate_: bool = False     # Logging the termination of the worker
 
     def __init__(
         self,
@@ -153,11 +155,23 @@ class PipeExecutor(Executor):
 
     def __head_worker_run(self):
         while True:
+            if not self.should_terminate_ and self.dispatcher_.is_empty():
+                # no tasks remaining, set termination flag and notify other nodes
+                self.should_terminate_ = True
+                self.__send_comm({
+                    "comm": "node_terminate",
+                    "data": None
+                })
+            
             # we get the model's output, and calc the loss
             self.__process_comm()
             self.__process_backward()
             self.__process_output()
             self.__process_input()
+            
+            if self.should_terminate_ and self.dispatcher_.is_empty():
+                break
+            
             time.sleep(1 / 100000)
 
     def __not_head_worker_run(self):
@@ -165,6 +179,12 @@ class PipeExecutor(Executor):
             self.__process_comm()
             self.__process_backward()
             self.__process_forward()
+            
+            if self.should_terminate_ and self.dispatcher_.is_empty():
+                # we would've gotten a COMM message from the head node telling us 
+                # to terminate by setting self.should_terminate_ to True, so we break
+                break
+            
             time.sleep(1 / 100000)
 
     def __head_process_step(self, message: PipeMessage):
@@ -264,6 +284,9 @@ class PipeExecutor(Executor):
             self.dispatcher_.dispatch_task_to_done(comm_data["data"])
         elif comm_data["comm"] == "task_terminal":
             self.dispatcher_.dispatch_task_to_terminal(comm_data["data"])
+        elif comm_data["comm"] == "node_terminate":
+            # head node notifies this worker node to terminate, so we set the flag
+            self.should_terminate_ = True
         else:
             raise NotImplementedError
 

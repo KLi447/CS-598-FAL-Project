@@ -118,3 +118,9 @@ class PipeDispatcher(BackendDispatcher):
             self.step_event_.notify(task)
 
         self._dispatch_task_out()
+
+    def is_empty(self) -> bool:
+        # check if the dispatcher is empty
+        # used/added for logging/profiling when checking if the worker is done w/ its tasks
+        return len(self.ready_) == 0 and len(self.running_) == 0
+
