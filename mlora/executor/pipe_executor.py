@@ -156,48 +156,95 @@ class PipeExecutor(Executor):
 
     def __head_worker_run(self):
         try:
+            last_activity_time = time.time()  # Track last activity time
+            termination_sent = False
+            
             while True:
-                if not self.should_terminate_ and self.dispatcher_.is_empty():
+                current_time = time.time()
+                had_activity = False
+                
+                # Check if we need to send termination signal
+                if not termination_sent and self.dispatcher_.is_empty():
                     # no tasks remaining, set termination flag and notify other nodes
                     self.should_terminate_ = True
+                    termination_sent = True
+                    
                     # Use broadcast instead of send_comm to notify all workers, not just the next one
+                    print("HEAD: Broadcasting `node_terminate` to all workers")
                     self.transport_.broadcast_comm(PipeMessageType.COMM, {
                         "comm": "node_terminate",
                         "data": None
                     })
-                    print("HEAD: Broadcasting `node_terminate` to all workers")
                 
-                # we get the model's output, and calc the loss
+                # Process all messages
                 self.__process_comm()
-                self.__process_backward()
-                self.__process_output()
-                self.__process_input()
                 
+                # Track if we did any real work
+                had_backward = self.__process_backward() 
+                had_output = self.__process_output()
+                had_input = self.__process_input()
+                
+                # Update activity timer if we did work
+                if had_backward or had_output or had_input:
+                    had_activity = True
+                    last_activity_time = current_time
+                
+                # Terminate if instructed and we've finished all tasks
                 if self.should_terminate_ and self.dispatcher_.is_empty():
-                    print("Terminating head worker loop!")
+                    # Give a little time for messages to propagate after sending termination
+                    if termination_sent and (current_time - last_activity_time > 5):
+                        print("Terminating head worker loop!")
+                        self.__cleanup()
+                        break
+                
+                # Safety timeout - if we've been in termination state without activity for 30 seconds
+                if self.should_terminate_ and (current_time - last_activity_time > 30):
+                    print("HEAD: Termination timeout reached, forcing shutdown")
                     self.__cleanup()
                     break
                 
-                time.sleep(1 / 100000)
+                # Use shorter sleep intervals when terminating for more responsive shutdown
+                sleep_time = 1/100000 if not self.should_terminate_ else 1/1000
+                time.sleep(sleep_time)
         except Exception as e:
             logging.error(f"Error in head worker loop: {str(e)}")
             self.__cleanup()
 
     def __not_head_worker_run(self):
         try:
+            last_activity_time = time.time()  # Track last activity time
+            
             while True:
-                self.__process_comm()
-                self.__process_backward()
-                self.__process_forward()
+                current_time = time.time()
+                had_activity = False
                 
+                # Process all messages
+                self.__process_comm()
+                
+                # Track if we did any real work
+                had_backward = self.__process_backward()
+                had_forward = self.__process_forward()
+                
+                # Update activity timer if we did work
+                if had_backward or had_forward:
+                    had_activity = True
+                    last_activity_time = current_time
+                
+                # Terminate if instructed and we've finished all tasks
                 if self.should_terminate_ and self.dispatcher_.is_empty():
-                    # we would've gotten a COMM message from the head node telling us 
-                    # to terminate by setting self.should_terminate_ to True, so we break
                     print(f"Terminating worker {self.rank_}!")
                     self.__cleanup()
                     break
                 
-                time.sleep(1 / 100000)
+                # Safety timeout - if we've been instructed to terminate but haven't had activity in 30 seconds
+                if self.should_terminate_ and (current_time - last_activity_time > 30):
+                    print(f"Worker {self.rank_}: Termination timeout reached, forcing shutdown")
+                    self.__cleanup()
+                    break
+                
+                # Use shorter sleep intervals when terminating for more responsive shutdown
+                sleep_time = 1/100000 if not self.should_terminate_ else 1/1000
+                time.sleep(sleep_time)
         except Exception as e:
             logging.error(f"Error in worker loop: {str(e)}")
             self.__cleanup()
@@ -221,7 +268,7 @@ class PipeExecutor(Executor):
     def __process_backward(self):
         message = self.transport_.recv_message(PipeMessageType.GRADIENTS, block=False)
         if message is None:
-            return
+            return False
 
         logging.info(
             f"Recv the gradients - {str(message.msg_id_)[:8]} from {message.src_}."
@@ -251,6 +298,8 @@ class PipeExecutor(Executor):
             assert message.model_data_ is not None
             for task_name in message.model_data_.task_name_:
                 self.dispatcher_.dispatch_task_to_step(task_name)
+                
+        return True
 
     def __process_forward(self):
         assert self.role_ != WorkerRole.HEAD
@@ -258,7 +307,7 @@ class PipeExecutor(Executor):
         # recv the tensors from prev-worker
         message = self.transport_.recv_message(PipeMessageType.ACTIVATIONS, block=False)
         if message is None:
-            return
+            return False
 
         logging.info(
             f"Recv the activations - {str(message.msg_id_)[:8]} from {message.src_}."
@@ -278,7 +327,9 @@ class PipeExecutor(Executor):
 
         self.default_stream_.poll()
         assert message.model_data_ is not None
-        return self.__send_activations(data, message.model_data_)
+        self.__send_activations(data, message.model_data_)
+        
+        return True
 
     def __process_comm(self):
         try:
@@ -306,6 +357,10 @@ class PipeExecutor(Executor):
             print(f"Worker {self.rank_}: Received `node_terminate` COMM message")
             # head node notifies this worker node to terminate, so we set the flag
             self.should_terminate_ = True
+            # If we're completely idle, initiate immediate cleanup
+            if self.dispatcher_.is_empty():
+                print(f"Worker {self.rank_}: No active tasks, initiating immediate shutdown")
+                self.__cleanup()
         else:
             raise NotImplementedError
 
@@ -315,7 +370,7 @@ class PipeExecutor(Executor):
         # recv the tensors from prev-worker
         message = self.transport_.recv_message(PipeMessageType.ACTIVATIONS, block=False)
         if message is None:
-            return
+            return False
 
         logging.debug(
             f"Recv the activations - {str(message.msg_id_)[:8]} from {message.src_}."
@@ -343,11 +398,13 @@ class PipeExecutor(Executor):
 
         if total_loss is not None:
             total_loss.backward()
+            
+        return True
 
     def __process_input(self):
         train_data: MLoRAData | None = self.dispatcher_.data()
         if train_data is None:
-            return
+            return False
         # step1. get the model data and execute the forward
         tensor_data = torch.tensor(
             train_data.batch_tokens_,
@@ -365,6 +422,8 @@ class PipeExecutor(Executor):
 
         # step3. cache the input, we need it to calc the loss
         self.input_cache_[train_data.model_data().random_id_] = train_data
+        
+        return True
 
     def __send_activations(self, tensor_data: torch.Tensor, batch_data: ModelData):
         assert isinstance(tensor_data, torch.Tensor)
@@ -485,6 +544,9 @@ class PipeExecutor(Executor):
     def __cleanup(self):
         """Cleanup resources to ensure proper termination."""
         try:
+            # First set the termination flag to prevent further processing
+            self.should_terminate_ = True
+            
             # Stop the transport - ensures all communication threads are joined
             if hasattr(self, 'transport_') and self.transport_ is not None:
                 logging.info(f"Worker {self.rank_}: Stopping transport...")
@@ -499,6 +561,9 @@ class PipeExecutor(Executor):
             # Release CUDA memory
             if hasattr(self, 'cache_forward_') and self.cache_forward_ is not None:
                 del self.cache_forward_
+            
+            # Release any pending tensor data
+            self.cache_forward_ = None
                 
             # Force garbage collection
             import gc
@@ -508,5 +573,22 @@ class PipeExecutor(Executor):
                 torch.cuda.empty_cache()
                 
             logging.info(f"Worker {self.rank_}: Cleanup completed")
+            
+            # Use os._exit as last resort if we're still hanging after 2 seconds
+            import os
+            import threading
+            
+            def emergency_exit():
+                logging.warning(f"Worker {self.rank_}: Emergency exit triggered")
+                os._exit(0)
+            
+            # Schedule emergency exit after 5 seconds if normal exit fails
+            timer = threading.Timer(5.0, emergency_exit)
+            timer.daemon = True
+            timer.start()
+            
         except Exception as e:
             logging.error(f"Error during cleanup: {str(e)}")
+            # Force exit even if cleanup fails
+            import os
+            os._exit(0)

@@ -80,12 +80,19 @@ class DeviceSwapQueue:
         logging.info(f"DeviceSwapQueue - {self.queue_name_} stop.")
 
     def start(self):
-        self.swap_thread_ = Thread(target=self.swap_thread)
+        self.swap_thread_ = Thread(target=self.swap_thread, name=f"SwapThread-{self.queue_name_}")
+        self.swap_thread_.daemon = True  # Make it daemon so Python can exit even if this thread is still running
         self.swap_thread_.start()
 
     def stop(self):
         self.stop_ = True
-        self.swap_thread_.join()
+        try:
+            # Set a timeout to prevent deadlocks
+            self.swap_thread_.join(timeout=3)
+            if self.swap_thread_.is_alive():
+                logging.warning(f"DeviceSwapQueue - {self.queue_name_}: Thread did not exit cleanly after timeout")
+        except Exception as e:
+            logging.error(f"DeviceSwapQueue - {self.queue_name_}: Error during thread join: {str(e)}")
 
     def get(self) -> PipeMessage:
         return self.dst_queue_.get(block=True)
