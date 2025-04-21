@@ -26,6 +26,8 @@ class Decoder(torch.nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, mask: torch.Tensor, input_args: ModelData
     ):
+        print(f"Tensor requires_grad: {hidden_states.requires_grad}, is_grad_enabled: {torch.is_grad_enabled()}")
+        
         # Attention
         with nvtx_range("f_attention_norm"):
             attn_norm_output = self.attn_norm_.forward(hidden_states)

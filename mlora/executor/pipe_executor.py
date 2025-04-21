@@ -162,6 +162,7 @@ class PipeExecutor(Executor):
                     "comm": "node_terminate",
                     "data": None
                 })
+                print("HEAD: Sent `node_terminate` to workers")
             
             # we get the model's output, and calc the loss
             self.__process_comm()
@@ -170,6 +171,7 @@ class PipeExecutor(Executor):
             self.__process_input()
             
             if self.should_terminate_ and self.dispatcher_.is_empty():
+                print("Terminating head worker loop!")
                 break
             
             time.sleep(1 / 100000)
@@ -183,6 +185,7 @@ class PipeExecutor(Executor):
             if self.should_terminate_ and self.dispatcher_.is_empty():
                 # we would've gotten a COMM message from the head node telling us 
                 # to terminate by setting self.should_terminate_ to True, so we break
+                print("Terminating!")
                 break
             
             time.sleep(1 / 100000)
@@ -285,6 +288,7 @@ class PipeExecutor(Executor):
         elif comm_data["comm"] == "task_terminal":
             self.dispatcher_.dispatch_task_to_terminal(comm_data["data"])
         elif comm_data["comm"] == "node_terminate":
+            print("Received `node_terminate` COMM message")
             # head node notifies this worker node to terminate, so we set the flag
             self.should_terminate_ = True
         else:
