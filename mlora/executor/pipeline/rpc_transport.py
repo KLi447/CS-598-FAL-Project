@@ -4,7 +4,7 @@ import queue
 import time
 import uuid
 from threading import Thread
-from typing import Any, Dict, override
+from typing import Any, Dict, List, override
 
 import torch
 import torch.distributed.rpc
@@ -58,6 +58,7 @@ class RpcTransport(Transport):
     activations_send_thread_: Thread
     gradients_send_thread_: Thread
     comm_send_thread_: Thread
+    termination_thread_: Thread = None  # New dedicated thread for termination signals
 
     def __init__(self, rank: int, world_size: int, worker_device: torch.device) -> None:
         super().__init__(rank, world_size, worker_device)
@@ -153,8 +154,11 @@ class RpcTransport(Transport):
 
         while not self.stop_ or not send_queue.empty():
             try:
-                msg = send_queue.get(block=True, timeout=10)
-            except Exception:
+                msg = send_queue.get(block=True, timeout=1)  # Reduced timeout for more frequent checks
+            except queue.Empty:
+                continue
+            except Exception as e:
+                logging.error(f"Error in comm send loop: {str(e)}")
                 continue
 
             logging.debug(
@@ -166,26 +170,64 @@ class RpcTransport(Transport):
     def __stop_send_loop(self):
         global RPCMessageRecvQueues
         global RPCMessageSendQueues
+        
+        logging.info(f"RpcTransport rank {self.rank_}: Stopping queues and threads...")
 
-        # first should stop the recv queue
-        for key in RPCMessageRecvQueues:
-            RPCMessageRecvQueues[key].stop()
-
-        # then stop the send queue
-        for key in RPCMessageSendQueues:
-            RPCMessageSendQueues[key].stop()
-
+        # Set the stop flag first to signal threads to exit their loops
         self.stop_ = True
-        self.activations_send_thread_.join()
-        self.gradients_send_thread_.join()
-        self.comm_send_thread_.join()
+        
+        # Allow threads a chance to detect the stop flag
+        time.sleep(0.1)
+
+        # Now stop the queues
+        for key in RPCMessageRecvQueues:
+            try:
+                RPCMessageRecvQueues[key].stop()
+                logging.info(f"RpcTransport rank {self.rank_}: Stopped recv queue for {key}")
+            except Exception as e:
+                logging.error(f"Error stopping recv queue {key}: {str(e)}")
+
+        for key in RPCMessageSendQueues:
+            try:
+                RPCMessageSendQueues[key].stop()
+                logging.info(f"RpcTransport rank {self.rank_}: Stopped send queue for {key}")
+            except Exception as e:
+                logging.error(f"Error stopping send queue {key}: {str(e)}")
+
+        # self.stop_ = True
+        # self.activations_send_thread_.join()
+        # self.gradients_send_thread_.join()
+        # self.comm_send_thread_.join()
+        # Join threads with timeout
+        threads = [self.activations_send_thread_, self.gradients_send_thread_, self.comm_send_thread_]
+        if self.termination_thread_ is not None:
+            threads.append(self.termination_thread_)
+            
+        for thread in threads:
+            if thread.is_alive():
+                logging.info(f"RpcTransport rank {self.rank_}: Joining thread {thread.name}")
+                thread.join(timeout=2)  # 2 second timeout
+                if thread.is_alive():
+                    logging.warning(f"RpcTransport rank {self.rank_}: Thread {thread.name} did not exit in time")
 
     def __stop_rpc(self):
         torch.distributed.rpc.shutdown()
 
     def stop(self):
+        """Stop all threads and RPC communication in a controlled manner."""
+        logging.info(f"RpcTransport rank {self.rank_}: Initiating shutdown...")
         self.__stop_send_loop()
-        self.__stop_rpc()
+        
+        # Add a small delay to allow other processes to handle final messages
+        time.sleep(0.5)
+        
+        try:
+            self.__stop_rpc()
+            logging.info(f"RpcTransport rank {self.rank_}: RPC shutdown completed")
+        except Exception as e:
+            logging.error(f"RpcTransport rank {self.rank_}: Error during RPC shutdown: {str(e)}")
+        
+        logging.info(f"RpcTransport rank {self.rank_}: Transport stopped")
 
     @override
     def recv_message(
@@ -232,20 +274,14 @@ class RpcTransport(Transport):
         send_queue.put(msg)
 
     @override
-    def recv_comm(self, msg_type: PipeMessageType, block: bool = False, timeout: float = None) -> PipeMessage:
+    def recv_comm(self, msg_type: PipeMessageType, block: bool = False) -> PipeMessage:
         global RPCCOMMMessageRecvQueues
 
         assert msg_type in RPCCOMMMessageRecvQueues
         recv_queue: queue.Queue = RPCCOMMMessageRecvQueues[msg_type]
 
         if block:
-            try:
-                if timeout is not None:
-                    return recv_queue.get(block=True, timeout=timeout)
-                else:
-                    return recv_queue.get()
-            except queue.Empty:
-                raise Exception("Queue is empty and timeout reached")
+            return recv_queue.get()
         else:
             return recv_queue.get_nowait()
 
@@ -254,24 +290,49 @@ class RpcTransport(Transport):
         self, msg_type: PipeMessageType, data: Any, sync: bool = False
     ) -> None:
         assert not sync, "RPC transport do not suppose sync == true!"
-        
-        # If data is already a PipeMessage object, use it directly
-        if isinstance(data, PipeMessage):
-            msg = data
-        else:
-            msg_id = uuid.uuid4().int
-            msg = PipeMessage(
-                src_=self.worker_name,
-                dst_=self.next_worker_name,
-                msg_type_=msg_type,
-                msg_id_=msg_id,
-                tensor_data_=None,
-                model_data_=None,
-                comm_data_=data,
-            )
+
+        msg_id = uuid.uuid4().int
+
+        msg = PipeMessage(
+            src_=self.worker_name,
+            dst_=self.next_worker_name,
+            msg_type_=msg_type,
+            msg_id_=msg_id,
+            tensor_data_=None,
+            model_data_=None,
+            comm_data_=data,
+        )
 
         global RPCCOMMMessageSendQueues
         assert msg.msg_type_ in RPCCOMMMessageSendQueues
 
         send_queue: queue.Queue = RPCCOMMMessageSendQueues[msg.msg_type_]
         send_queue.put(msg)
+        
+    def broadcast_comm(self, msg_type: PipeMessageType, data: Any) -> None:
+        """Broadcast a communication message to all workers in the pipeline."""
+        # For termination signals, we need to send to all workers except self
+        for rank in range(self.world_size_):
+            if rank == self.rank_:
+                continue  # Skip sending to self
+                
+            dst = f"worker-{rank}"
+            msg_id = uuid.uuid4().int
+            
+            msg = PipeMessage(
+                src_=self.worker_name,
+                dst_=dst,
+                msg_type_=msg_type,
+                msg_id_=msg_id,
+                tensor_data_=None,
+                model_data_=None,
+                comm_data_=data,
+            )
+            
+            global RPCCOMMMessageSendQueues
+            assert msg.msg_type_ in RPCCOMMMessageSendQueues
+            
+            send_queue: queue.Queue = RPCCOMMMessageSendQueues[msg.msg_type_]
+            send_queue.put(msg)
+            
+            logging.info(f"Broadcasting {data['comm']} message to {dst}")

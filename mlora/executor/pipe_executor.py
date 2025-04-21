@@ -1,4 +1,5 @@
 import logging
+import queue
 import time
 import uuid
 from enum import Enum, auto
@@ -154,77 +155,52 @@ class PipeExecutor(Executor):
         torch.cuda.empty_cache()
 
     def __head_worker_run(self):
-        while True:
-            if not self.should_terminate_ and self.dispatcher_.is_empty():
-                # no tasks remaining, set termination flag and notify other nodes
-                self.should_terminate_ = True
-                # self.__send_comm({
-                #     "comm": "node_terminate",
-                #     "data": None
-                # })
-                # print("HEAD: Sent `node_terminate` to workers")
-                print("HEAD: No more tasks. Sending `node_terminate` to workers")
-                for worker_idx in range(1, self.world_size_):
-                    worker_name = f"worker-{worker_idx}"
-                    # Send termination message to each worker explicitly
-                    term_msg = PipeMessage(
-                        src_=self.transport_.worker_name,
-                        dst_=worker_name,
-                        msg_type_=PipeMessageType.COMM,
-                        msg_id_=uuid.uuid4().int,
-                        tensor_data_=None,
-                        model_data_=None,
-                        comm_data_={"comm": "node_terminate", "data": None}
-                    )
-                    self.transport_.send_comm(PipeMessageType.COMM, term_msg, sync=True)
-                print("HEAD: Sent `node_terminate` to all workers")
-            
-            # we get the model's output, and calc the loss
-            self.__process_comm()
-            self.__process_backward()
-            self.__process_output()
-            self.__process_input()
-            
-            if self.should_terminate_ and self.dispatcher_.is_empty():
-                print("Terminating head worker loop!")
-                # Call stop before breaking to clean up resources
-                self.transport_.stop()
-                if hasattr(self, 'input_queue_') and self.input_queue_ is not None:
-                    self.input_queue_.stop()
-                break
-            
-            time.sleep(1 / 100000)
+        try:
+            while True:
+                if not self.should_terminate_ and self.dispatcher_.is_empty():
+                    # no tasks remaining, set termination flag and notify other nodes
+                    self.should_terminate_ = True
+                    # Use broadcast instead of send_comm to notify all workers, not just the next one
+                    self.transport_.broadcast_comm(PipeMessageType.COMM, {
+                        "comm": "node_terminate",
+                        "data": None
+                    })
+                    print("HEAD: Broadcasting `node_terminate` to all workers")
+                
+                # we get the model's output, and calc the loss
+                self.__process_comm()
+                self.__process_backward()
+                self.__process_output()
+                self.__process_input()
+                
+                if self.should_terminate_ and self.dispatcher_.is_empty():
+                    print("Terminating head worker loop!")
+                    self.__cleanup()
+                    break
+                
+                time.sleep(1 / 100000)
+        except Exception as e:
+            logging.error(f"Error in head worker loop: {str(e)}")
+            self.__cleanup()
 
     def __not_head_worker_run(self):
-        check_comm_count = 0
-        
-        while True:
-            # Try to receive COMM messages with a short timeout every 50 iterations
-            # for better responsiveness to termination signals
-            check_comm_count += 1
-            if check_comm_count >= 50:
-                try:
-                    msg = self.transport_.recv_comm(PipeMessageType.COMM, block=True, timeout=0.01)
-                    if msg.comm_data_["comm"] == "node_terminate":
-                        print(f"Worker {self.rank_}: Received `node_terminate` COMM message")
-                        self.should_terminate_ = True
-                except Exception:
-                    pass
-                check_comm_count = 0
-            else:
-                self.__process_comm()   # originally this always ran
+        try:
+            while True:
+                self.__process_comm()
+                self.__process_backward()
+                self.__process_forward()
                 
-            self.__process_backward()
-            self.__process_forward()
-            
-            if self.should_terminate_ and self.dispatcher_.is_empty():
-                # we would've gotten a COMM message from the head node telling us 
-                # to terminate by setting self.should_terminate_ to True, so we break
-                print(f"Worker {self.rank_}: Terminating worker loop!")
-                self.transport_.stop()
-                break
-            
-            time.sleep(1 / 100000)
+                if self.should_terminate_ and self.dispatcher_.is_empty():
+                    # we would've gotten a COMM message from the head node telling us 
+                    # to terminate by setting self.should_terminate_ to True, so we break
+                    print(f"Terminating worker {self.rank_}!")
+                    self.__cleanup()
+                    break
+                
+                time.sleep(1 / 100000)
+        except Exception as e:
+            logging.error(f"Error in worker loop: {str(e)}")
+            self.__cleanup()
 
     def __head_process_step(self, message: PipeMessage):
         assert message.model_data_ is not None
@@ -310,7 +286,10 @@ class PipeExecutor(Executor):
                 PipeMessageType.COMM, block=False
             )
             comm_data = msg.comm_data_
-        except Exception:
+        except queue.Empty:
+            return
+        except Exception as e:
+            logging.error(f"Error receiving COMM message: {str(e)}")
             return
 
         if comm_data["comm"] == "task_add":
@@ -419,12 +398,16 @@ class PipeExecutor(Executor):
         return data[0]
 
     def execute(self) -> None:
-        if self.role_ == WorkerRole.HEAD:
-            self.__head_worker_run()
-        elif self.role_ == WorkerRole.MID or self.role_ == WorkerRole.TAIL:
-            self.__not_head_worker_run()
-        else:
-            raise NotImplementedError
+        try:
+            if self.role_ == WorkerRole.HEAD:
+                self.__head_worker_run()
+            elif self.role_ == WorkerRole.MID or self.role_ == WorkerRole.TAIL:
+                self.__not_head_worker_run()
+            else:
+                raise NotImplementedError
+        except Exception as e:
+            logging.error(f"Error during execution: {str(e)}")
+            self.__cleanup()
 
     def add_task(self, config: TaskConfig):
         if self.role_ != WorkerRole.TAIL:
@@ -498,3 +481,32 @@ class PipeExecutor(Executor):
                 continue
             ret_val.update(module.wrapper_module_.linears_info())
         return ret_val
+
+    def __cleanup(self):
+        """Cleanup resources to ensure proper termination."""
+        try:
+            # Stop the transport - ensures all communication threads are joined
+            if hasattr(self, 'transport_') and self.transport_ is not None:
+                logging.info(f"Worker {self.rank_}: Stopping transport...")
+                self.transport_.stop()
+                
+            # Clear caches to help garbage collection
+            if hasattr(self, 'backward_cache_'):
+                self.backward_cache_.clear()
+            if hasattr(self, 'input_cache_'):
+                self.input_cache_.clear()
+                
+            # Release CUDA memory
+            if hasattr(self, 'cache_forward_') and self.cache_forward_ is not None:
+                del self.cache_forward_
+                
+            # Force garbage collection
+            import gc
+            gc.collect()
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+            logging.info(f"Worker {self.rank_}: Cleanup completed")
+        except Exception as e:
+            logging.error(f"Error during cleanup: {str(e)}")
