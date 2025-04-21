@@ -1,6 +1,6 @@
 export MASTER_ADDR=c240g5-110205.wisc.cloudlab.us
 export MASTER_PORT=12355
-nsys profile --trace=cuda,nvtx --output=mlora_profile --force-overwrite true \
+nsys profile --trace=cuda,nvtx,osrt --stats=true --output=mlora_profile --force-overwrite true \
 python mlora_pp_train.py \
     --base_model TinyLlama/TinyLlama-1.1B-Chat-v0.4 \
     --trace \
