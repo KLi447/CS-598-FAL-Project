@@ -158,11 +158,26 @@ class PipeExecutor(Executor):
             if not self.should_terminate_ and self.dispatcher_.is_empty():
                 # no tasks remaining, set termination flag and notify other nodes
                 self.should_terminate_ = True
-                self.__send_comm({
-                    "comm": "node_terminate",
-                    "data": None
-                })
-                print("HEAD: Sent `node_terminate` to workers")
+                # self.__send_comm({
+                #     "comm": "node_terminate",
+                #     "data": None
+                # })
+                # print("HEAD: Sent `node_terminate` to workers")
+                print("HEAD: No more tasks. Sending `node_terminate` to workers")
+                for worker_idx in range(1, self.world_size_):
+                    worker_name = f"worker-{worker_idx}"
+                    # Send termination message to each worker explicitly
+                    term_msg = PipeMessage(
+                        src_=self.transport_.worker_name,
+                        dst_=worker_name,
+                        msg_type_=PipeMessageType.COMM,
+                        msg_id_=uuid.uuid4().int,
+                        tensor_data_=None,
+                        model_data_=None,
+                        comm_data_={"comm": "node_terminate", "data": None}
+                    )
+                    self.transport_.send_comm(PipeMessageType.COMM, term_msg, sync=True)
+                print("HEAD: Sent `node_terminate` to all workers")
             
             # we get the model's output, and calc the loss
             self.__process_comm()
@@ -172,20 +187,41 @@ class PipeExecutor(Executor):
             
             if self.should_terminate_ and self.dispatcher_.is_empty():
                 print("Terminating head worker loop!")
+                # Call stop before breaking to clean up resources
+                self.transport_.stop()
+                if hasattr(self, 'input_queue_') and self.input_queue_ is not None:
+                    self.input_queue_.stop()
                 break
             
             time.sleep(1 / 100000)
 
     def __not_head_worker_run(self):
+        check_comm_count = 0
+        
         while True:
-            self.__process_comm()
+            # Try to receive COMM messages with a short timeout every 50 iterations
+            # for better responsiveness to termination signals
+            check_comm_count += 1
+            if check_comm_count >= 50:
+                try:
+                    msg = self.transport_.recv_comm(PipeMessageType.COMM, block=True, timeout=0.01)
+                    if msg.comm_data_["comm"] == "node_terminate":
+                        print(f"Worker {self.rank_}: Received `node_terminate` COMM message")
+                        self.should_terminate_ = True
+                except Exception:
+                    pass
+                check_comm_count = 0
+            else:
+                self.__process_comm()   # originally this always ran
+                
             self.__process_backward()
             self.__process_forward()
             
             if self.should_terminate_ and self.dispatcher_.is_empty():
                 # we would've gotten a COMM message from the head node telling us 
                 # to terminate by setting self.should_terminate_ to True, so we break
-                print("Terminating!")
+                print(f"Worker {self.rank_}: Terminating worker loop!")
+                self.transport_.stop()
                 break
             
             time.sleep(1 / 100000)
@@ -288,7 +324,7 @@ class PipeExecutor(Executor):
         elif comm_data["comm"] == "task_terminal":
             self.dispatcher_.dispatch_task_to_terminal(comm_data["data"])
         elif comm_data["comm"] == "node_terminate":
-            print("Received `node_terminate` COMM message")
+            print(f"Worker {self.rank_}: Received `node_terminate` COMM message")
             # head node notifies this worker node to terminate, so we set the flag
             self.should_terminate_ = True
         else:

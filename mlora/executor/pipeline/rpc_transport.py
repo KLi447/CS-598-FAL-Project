@@ -232,14 +232,20 @@ class RpcTransport(Transport):
         send_queue.put(msg)
 
     @override
-    def recv_comm(self, msg_type: PipeMessageType, block: bool = False) -> PipeMessage:
+    def recv_comm(self, msg_type: PipeMessageType, block: bool = False, timeout: float = None) -> PipeMessage:
         global RPCCOMMMessageRecvQueues
 
         assert msg_type in RPCCOMMMessageRecvQueues
         recv_queue: queue.Queue = RPCCOMMMessageRecvQueues[msg_type]
 
         if block:
-            return recv_queue.get()
+            try:
+                if timeout is not None:
+                    return recv_queue.get(block=True, timeout=timeout)
+                else:
+                    return recv_queue.get()
+            except queue.Empty:
+                raise Exception("Queue is empty and timeout reached")
         else:
             return recv_queue.get_nowait()
 
@@ -248,18 +254,21 @@ class RpcTransport(Transport):
         self, msg_type: PipeMessageType, data: Any, sync: bool = False
     ) -> None:
         assert not sync, "RPC transport do not suppose sync == true!"
-
-        msg_id = uuid.uuid4().int
-
-        msg = PipeMessage(
-            src_=self.worker_name,
-            dst_=self.next_worker_name,
-            msg_type_=msg_type,
-            msg_id_=msg_id,
-            tensor_data_=None,
-            model_data_=None,
-            comm_data_=data,
-        )
+        
+        # If data is already a PipeMessage object, use it directly
+        if isinstance(data, PipeMessage):
+            msg = data
+        else:
+            msg_id = uuid.uuid4().int
+            msg = PipeMessage(
+                src_=self.worker_name,
+                dst_=self.next_worker_name,
+                msg_type_=msg_type,
+                msg_id_=msg_id,
+                tensor_data_=None,
+                model_data_=None,
+                comm_data_=data,
+            )
 
         global RPCCOMMMessageSendQueues
         assert msg.msg_type_ in RPCCOMMMessageSendQueues
