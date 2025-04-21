@@ -1,0 +1,21 @@
+name: "multitask"
+type: "multitask"
+adapter:
+  name: "multitask_adapter"
+  type: "lora"
+  rank: 8
+  alpha: 16
+  dropout: 0.1
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+dataset:
+  name: "multitask_data"
+  type: "json"
+  path: "data/multitask_data.json"
+  prompt_template: "templates/multitask_prompt.txt"
+  max_seq_len: 512
+  batch_size: 4
+  num_workers: 4
+lm_weight: 0.4
+cls_weight: 0.3
+contrastive_weight: 0.3
+temperature: 0.07 
