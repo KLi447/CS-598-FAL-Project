@@ -1,8 +1,12 @@
-from typing import List, Set, override
+from typing import List, Set, override, Dict
+import threading
+import time
 
 from mlora.config.dispatcher import DispatcherConfig
 from mlora.executor.task import Task
 from mlora.model.args import Masks, MLoRAData, MLoRADataConfig, Tokens
+from mlora.utils.gpu_state import GPUState, query_all_gpus, AdapterProfile
+import logging
 
 from .backend_dispatcher import BackendDispatcher
 
@@ -10,9 +14,30 @@ from .backend_dispatcher import BackendDispatcher
 class PipeDispatcher(BackendDispatcher):
     lock_set_: Set[str]
 
-    def __init__(self, config: DispatcherConfig) -> None:
+    def __init__(self, config: DispatcherConfig, adapter_profiles: Dict[str, AdapterProfile]) -> None:
         super().__init__(config)
         self.lock_set_ = set()
+        self.adapter_profiles = adapter_profiles
+
+        threading.Thread(target=self._replan_loop).start()
+
+    def _replan_loop(self):
+        while True:
+            self._compute_placement()
+            time.sleep(5) #fix later
+
+    def _compute_placement(self):
+        gpu_states = query_all_gpus()
+        candidates = list(self.ready_)
+
+        def cost_key(task):
+            adapter = task.adapter_name()[0]
+            prof    = self.adapter_profiles[adapter]
+            return prof.flops_per_token_fwd # ignore memory for now
+
+        candidates.sort(key=cost_key, reverse=True)
+
+        self.ready_ = candidates # because mLoRA is FIFO and we've sorted
 
     @override
     def _dispatch_task_in(self):

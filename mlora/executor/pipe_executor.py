@@ -3,6 +3,7 @@ import time
 import uuid
 from enum import Enum, auto
 from typing import Any, Dict, List, OrderedDict, cast
+from dataclasses import dataclass
 
 import torch
 
@@ -13,6 +14,7 @@ from mlora.model.args import LinearInfo, MLoRAData, ModelData
 from mlora.model.llm import LLMModel
 from mlora.model.llm.model_llama import precompute_mask
 from mlora.model.tokenizer import Tokenizer
+from mlora.utils.gpu_state import AdapterProfile
 
 from .dispatcher import DISPATCHER_CLASS, PipeDispatcher
 from .executor import Executor
@@ -52,6 +54,8 @@ class PipeExecutor(Executor):
     backward_cache_: Dict[int, torch.Tensor]
     input_cache_: Dict[int, MLoRAData]
 
+    # also this
+    adapter_profiles: Dict[str, AdapterProfile]
     dispatcher_: PipeDispatcher
 
     def __init__(
@@ -82,15 +86,19 @@ class PipeExecutor(Executor):
         self.__init_worker()
         self.__init_partition()
 
-        # record the default stream to sync
+        self.__calculate_costs()
+
         self.default_stream_ = CudaStream(torch.cuda.default_stream(self.device_))
+        self.recv_stream_ = CudaStream(torch.cuda.Stream())
+        self.comp_stream_ = CudaStream(torch.cuda.Stream())
+        self.send_stream_ = CudaStream(torch.cuda.Stream())
         # init the rpc and wait the cluster node ready
         self.transport_ = RpcTransport(
             self.rank_, self.world_size_, torch.device(self.device_)
         )
 
         self.dispatcher_: PipeDispatcher = cast(
-            PipeDispatcher, DISPATCHER_CLASS["pipe"](config.dispatcher_)
+            PipeDispatcher, DISPATCHER_CLASS["pipe"](config.dispatcher_, self.adapter_profiles)
         )
 
         hook_func = {
@@ -147,6 +155,59 @@ class PipeExecutor(Executor):
         del self.model_
 
         torch.cuda.empty_cache()
+
+    def __calculate_costs(self):
+        self.adapter_profiles: Dict[str, AdapterProfile] = {}
+
+        base_layers = list(self.partial_model_)
+
+        for name, adapter in self.mlora_config.adapters().items():
+            adapter = adapter.export()
+            if adapter["peft_type"] != "LORA":
+                continue
+
+            r = adapter["r"]
+            targets = adapter["target_modules"]
+
+            total_params     = 0
+            total_fwd_flops  = 0
+            total_bwd_flops  = 0
+
+            for layer in base_layers:
+                decoder = getattr(layer, "wrapper_module_", None)
+                if decoder is None:
+                    continue
+
+                # attention (is all you need)
+                attn = getattr(decoder, "attn_", None)
+                if attn is not None:
+                    for proj in ("wq_", "wk_", "wv_", "wo_"):
+                        lin = getattr(attn, proj, None)
+                        real_lin = lin.weight_ if hasattr(lin, "weight_") else lin
+                        in_f, out_f = getattr(real_lin, "in_features", None), getattr(real_lin, "out_features", None)
+                        mods = r * in_f + out_f * r
+                        total_params    += mods
+                        total_fwd_flops += mods
+                        total_bwd_flops += 2 * mods
+
+                # mlp
+                mlp = getattr(decoder, "mlp_", None)
+                if mlp is not None:
+                    for proj in ("gate_", "down_", "up_"):
+                        lin = getattr(mlp, proj, None)
+                        real_lin = lin.weight_ if hasattr(lin, "weight_") else lin
+                        in_f, out_f = getattr(real_lin, "in_features", None), getattr(real_lin, "out_features", None)
+                        mods = r * in_f + out_f * r
+                        total_params    += mods
+                        total_fwd_flops += mods
+                        total_bwd_flops += 2 * mods
+
+            param_bytes = total_params * 4  # fp32
+            self.adapter_profiles[name] = AdapterProfile(
+                param_bytes           = param_bytes,
+                flops_per_token_fwd   = total_fwd_flops,
+                flops_per_token_bwd   = total_bwd_flops,
+            )
 
     def __head_worker_run(self):
         while True:
@@ -217,15 +278,17 @@ class PipeExecutor(Executor):
         logging.debug(
             f"Recv the activations - {str(message.msg_id_)[:8]} from {message.src_}."
         )
-
-        data = RecvOperator.apply(
-            torch.tensor(1.0, requires_grad=True), self.transport_, message
-        )
+        with torch.cuda.stream(self.recv_stream_.stream_):
+            data = RecvOperator.apply(
+                torch.tensor(1.0, requires_grad=True), self.transport_, message
+            )
         # we need to wait the default stream calcuate all tensor
         # and then send it, so we hook the pre stage fn to poll the stream
         data.grad_fn.pre_stage_fn = self.default_stream_.poll  # type: ignore
         assert message.model_data_ is not None
-        data = self.__forward(data, message.model_data_)
+        
+        with torch.cuda.stream(self.comp_stream_.stream_):
+            data = self.__forward(data, message.model_data_)
 
         self.default_stream_.poll()
         assert message.model_data_ is not None
@@ -264,10 +327,10 @@ class PipeExecutor(Executor):
         logging.debug(
             f"Recv the activations - {str(message.msg_id_)[:8]} from {message.src_}."
         )
-
-        output: torch.Tensor = RecvOperator.apply(
-            torch.tensor(1.0, requires_grad=True), self.transport_, message
-        )
+        with torch.cuda.stream(self.recv_stream_.stream_):
+            output: torch.Tensor = RecvOperator.apply(
+                torch.tensor(1.0, requires_grad=True), self.transport_, message
+            )
         # we need to wait the default stream calcuate all tensor
         # and then send it, so we hook the pre stage fn to poll the stream
         output.grad_fn.pre_stage_fn = self.default_stream_.poll  # type: ignore
@@ -299,8 +362,8 @@ class PipeExecutor(Executor):
             device=self.device_,
             requires_grad=False,
         )
-
-        hidden_data = self.__forward(tensor_data, train_data.model_data())
+        with torch.cuda.stream(self.comp_stream_.stream_):
+            hidden_data = self.__forward(tensor_data, train_data.model_data())
 
         # step2. then send the hidden state to next worker
         self.default_stream_.poll()
@@ -316,13 +379,17 @@ class PipeExecutor(Executor):
         msg_id = uuid.uuid4().int
         assert msg_id not in self.backward_cache_
 
-        phony: torch.Tensor = SendOperator.apply(
-            torch.tensor(1.0, requires_grad=True),
-            tensor_data,
-            self.transport_,
-            msg_id,
-            batch_data,
-        )
+        with torch.cuda.stream(self.send_stream_.stream_):
+            phony: torch.Tensor = SendOperator.apply(
+                torch.tensor(1.0, requires_grad=True),
+                tensor_data,
+                self.transport_,
+                msg_id,
+                batch_data,
+            )
+
+        self.default_stream_.stream_.wait_stream(self.send_stream_.stream_)
+        self.default_stream_.poll()
 
         self.backward_cache_[msg_id] = phony
 
