@@ -1,0 +1,44 @@
+model:
+  name: "llama2-7b"  # or your base model name
+  path: "path/to/your/model"
+
+adapters:
+  - name: "patent_classifier_lora"
+    type: "lora"
+    rank: 8
+    alpha: 16
+    dropout: 0.1
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    bias: "none"
+
+datasets:
+  - name: "patent_classification"
+    type: "classification"
+    path: "data/patent-classification"
+    split: "train"
+    max_length: 512
+    text_column: "text"
+    label_column: "label"
+
+tasks:
+  - name: "patent_classification_task"
+    type: "train"
+    adapter: "patent_classifier_lora"
+    dataset: "patent_classification"
+    batch_size: 32
+    mini_batch_size: 8
+    num_epochs: 5
+    cutoff_len: 512
+    save_step: 1000
+
+optimizer:
+  type: "adamw"
+  lr: 1e-4
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+  eps: 1e-8
+
+lr_scheduler:
+  type: "cosine"
+  warmup_steps: 100
+  total_steps: 5000 
