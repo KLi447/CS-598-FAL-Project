@@ -12,6 +12,10 @@ from .backend_dispatcher import BackendDispatcher
 
 
 class PipeDispatcher(BackendDispatcher):
+    
+    # set of task names that are currently "locked" (ie being processed or 
+    # should not be processed again until it is unlocked). Used to prevent 
+    # the same task from being processed multiple times concurrently
     lock_set_: Set[str]
 
     def __init__(self, config: DispatcherConfig, adapter_profiles: Dict[str, AdapterProfile]) -> None:
@@ -19,28 +23,22 @@ class PipeDispatcher(BackendDispatcher):
         self.lock_set_ = set()
         self.adapter_profiles = adapter_profiles
 
-        threading.Thread(target=self._replan_loop).start()
-
-    def _replan_loop(self):
-        while True:
-            self._compute_placement()
-            time.sleep(5) #fix later
-
-    def _compute_placement(self):
+    def _compute_placement(self, candidates: List[Task]):
         gpu_states = query_all_gpus()
-        candidates = list(self.ready_)
 
         def cost_key(task):
             adapter = task.adapter_name()[0]
             prof    = self.adapter_profiles[adapter]
             return prof.flops_per_token_fwd # ignore memory for now
 
-        candidates.sort(key=cost_key, reverse=True)
-
-        self.ready_ = candidates # because mLoRA is FIFO and we've sorted
+        # return a copy of the list so that we don't modify candidates list itself
+        return sorted(candidates, key=cost_key, reverse=True)
 
     @override
     def _dispatch_task_in(self):
+        # Update the terminate and ready queues and then dispatch tasks from the 
+        # ready queue to the running queue as long as there is room 
+        
         # ready task to terminate
         terminate_task = [task for task in self.ready_ if task.is_terminate()]
         self.ready_ = [task for task in self.ready_ if not task.is_terminate()]
@@ -53,6 +51,8 @@ class PipeDispatcher(BackendDispatcher):
             task = self.ready_.pop(0)
             self.running_.append(task)
             self.running_event_.notify(task)
+        
+        # NOTE: I could also update the order of running_ here based on the compute_placement, rn its in .data() tho
 
     def find_the_task(self, task_name: str) -> Task:
         # the worker do not really dispather the task
@@ -93,28 +93,41 @@ class PipeDispatcher(BackendDispatcher):
             return
         self.lock_set_.remove(name)
 
+    # used to check if a task is locked
     def is_lock(self, name: str):
         return name in self.lock_set_
 
     @override
     def data(self) -> MLoRAData | None:
+        
+        # re-update the queues before grabbing the new task to be scheduled
         self._dispatch_task_in()
 
         batch_tokens: List[Tokens] = []
         batch_masks: List[Masks] = []
         data_configs: List[MLoRADataConfig] = []
 
-        can_run_task = list(
+        # avoid locked tasks
+        can_run_tasks = list(
             filter(lambda task: not self.is_lock(task.task_name()), self.running_)
         )
 
-        if len(can_run_task) == 0:
+        if len(can_run_tasks) == 0:
             return None
-
+        
         # get all train data
         start_idx: int = 0
         # pipe dispatcher just run one task
-        task = can_run_task[0]
+        
+        # NOTE: Custom Scheduling Notes:
+        # Updating the scheduling order here. However, for improved performance, we may not want
+        # to recompute the order each time? We could also call self._compute_placement inside dispatch_task_in()
+        # instead of here to actually update self.running_ itself
+        
+        task = self._compute_placement(can_run_tasks)[0]
+        logging.info(f"[DEBUG] Currently Scheduled Task: {task.task_name()}")
+        
+        # task = can_run_tasks[0]   # previously was just grabbing in FIFO order
 
         data, data_config = task.data(start_idx)
 
