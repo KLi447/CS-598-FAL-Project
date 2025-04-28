@@ -90,7 +90,7 @@ class PipeExecutor(Executor):
 
         self.default_stream_ = CudaStream(torch.cuda.default_stream(self.device_))
         
-        n = config.dispatcher_.concurrency_num_ # should be num adapters
+        n = len(self.mlora_config.adapters().items())
         self.stream_pools: List[Tuple[CudaStream,CudaStream,CudaStream]] = []
         self.stream_taken: List[bool] = [False] * n
         for _ in range(n):
@@ -265,7 +265,13 @@ class PipeExecutor(Executor):
 
         phony: torch.Tensor = self.backward_cache_[msg_id]
         phony.grad_fn.grad_from_next_worker = message.tensor_data_  # type: ignore
-        phony.backward()
+
+        tn = message.model_data_.task_name_[0]
+        slot = self.task_slot[tn]
+        recv_stream, _, _ = self.stream_pools[slot]
+
+        with torch.cuda.stream(recv_stream.stream_):
+            phony.backward()
 
         del self.backward_cache_[msg_id]
 
@@ -296,6 +302,9 @@ class PipeExecutor(Executor):
             data = RecvOperator.apply(
                 torch.tensor(1.0, requires_grad=True), self.transport_, message
             )
+
+        comp_stream.stream_.wait_stream(recv_stream.stream_)
+
         # we need to wait the default stream calcuate all tensor
         # and then send it, so we hook the pre stage fn to poll the stream
         data.grad_fn.pre_stage_fn = self.default_stream_.poll  # type: ignore
@@ -303,8 +312,8 @@ class PipeExecutor(Executor):
         
         with torch.cuda.stream(comp_stream.stream_):
             data = self.__forward(data, message.model_data_)
-        self.default_stream_.poll()
 
+        comp_stream.poll()
         assert message.model_data_ is not None
         return self.__send_activations(data, message.model_data_)
 
@@ -344,12 +353,15 @@ class PipeExecutor(Executor):
 
         tn = message.model_data_.task_name_[0]
         slot = self.task_slot[tn]
-        recv_stream_, _, _ = self.stream_pools[slot]
+        recv_stream, comp_stream, _ = self.stream_pools[slot]
 
-        with torch.cuda.stream(recv_stream_.stream_):
+        with torch.cuda.stream(recv_stream.stream_):
             output: torch.Tensor = RecvOperator.apply(
                 torch.tensor(1.0, requires_grad=True), self.transport_, message
             )
+
+        comp_stream.stream_.wait_stream(recv_stream.stream_)
+
         # we need to wait the default stream calcuate all tensor
         # and then send it, so we hook the pre stage fn to poll the stream
         output.grad_fn.pre_stage_fn = self.default_stream_.poll  # type: ignore
@@ -361,14 +373,15 @@ class PipeExecutor(Executor):
 
         total_loss: torch.Tensor | None = None
 
-        for config in train_data.data_config_:
-            loss = config.loss_fn_(output, labels, masks)
-            if loss is None:
-                continue
-            total_loss = loss if total_loss is None else total_loss + loss
+        with torch.cuda.stream(comp_stream.stream_):
+            for config in train_data.data_config_:
+                loss = config.loss_fn_(output, labels, masks)
+                if loss is None:
+                    continue
+                total_loss = loss if total_loss is None else total_loss + loss
 
-        if total_loss is not None:
-            total_loss.backward()
+                if total_loss is not None:
+                    total_loss.backward()
 
     def __process_input(self):
         train_data: MLoRAData | None = self.dispatcher_.data()
@@ -384,13 +397,15 @@ class PipeExecutor(Executor):
 
         tn = train_data.data_config_[0].task_name_
         slot = self.task_slot[tn]
-        recv_stream, comp_stream, send_stream = self.stream_pools[slot]
+        recv_stream, comp_stream, _ = self.stream_pools[slot]
+
+        comp_stream.stream_.wait_stream(recv_stream.stream_)
 
         with torch.cuda.stream(comp_stream.stream_):
             hidden_data = self.__forward(tensor_data, train_data.model_data())
 
         # step2. then send the hidden state to next worker
-        self.default_stream_.poll()
+        comp_stream.poll()
         self.__send_activations(hidden_data, train_data.model_data())
 
         # step3. cache the input, we need it to calc the loss
@@ -405,7 +420,11 @@ class PipeExecutor(Executor):
 
         tn = batch_data.task_name_[0]
         slot = self.task_slot[tn]
-        _, _, send_stream = self.stream_pools[slot]
+        _, comp_stream, send_stream = self.stream_pools[slot]
+
+        send_stream.stream_.wait_stream(comp_stream.stream_)
+        send_stream.stream_.wait_stream(self.default_stream_.stream_) ##FIXME
+        ## FIXME I'm still missing a comp_stream somewhere! nothing should be running on the default stream?
 
         with torch.cuda.stream(send_stream.stream_):
             phony: torch.Tensor = SendOperator.apply(
@@ -415,9 +434,6 @@ class PipeExecutor(Executor):
                 msg_id,
                 batch_data,
             )
-
-        self.default_stream_.stream_.wait_stream(send_stream.stream_)
-        self.default_stream_.poll()
 
         self.backward_cache_[msg_id] = phony
 
