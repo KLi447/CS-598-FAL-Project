@@ -2,7 +2,7 @@ import logging
 import time
 import uuid
 from enum import Enum, auto
-from typing import Any, Dict, List, OrderedDict, cast
+from typing import Any, Dict, List, OrderedDict, Tuple, cast
 from dataclasses import dataclass
 
 import torch
@@ -57,6 +57,9 @@ class PipeExecutor(Executor):
     # also this
     adapter_profiles: Dict[str, AdapterProfile]
     dispatcher_: PipeDispatcher
+    stream_pools: List[Tuple[CudaStream, CudaStream, CudaStream]]
+    stream_taken: List[bool]
+    task_slot: Dict[str, int]
 
     def __init__(
         self,
@@ -91,20 +94,22 @@ class PipeExecutor(Executor):
         self.default_stream_ = CudaStream(torch.cuda.default_stream(self.device_))
         
         n = len(self.mlora_config.adapters().items())
-        self.stream_pools: List[Tuple[CudaStream,CudaStream,CudaStream]] = []
-        self.stream_taken: List[bool] = [False] * n
+        self.stream_pools = []
+        self.stream_taken = [False] * n
         for _ in range(n):
             self.stream_pools.append((
-                CudaStream(torch.cuda.Stream()),
-                CudaStream(torch.cuda.Stream()),
-                CudaStream(torch.cuda.Stream()),
+                CudaStream(torch.cuda.Stream(device=self.device_)),
+                CudaStream(torch.cuda.Stream(device=self.device_)),
+                CudaStream(torch.cuda.Stream(device=self.device_)),
             ))
-        self.task_slot: Dict[str,int] = {}
+        self.task_slot = {}
 
         # init the rpc and wait the cluster node ready
         self.transport_ = RpcTransport(
             self.rank_, self.world_size_, torch.device(self.device_)
         )
+
+        config.dispatcher_.concurrency_num_ = n # eventually I should get rid of the logic to process this entirely
 
         self.dispatcher_: PipeDispatcher = cast(
             PipeDispatcher, DISPATCHER_CLASS["pipe"](config.dispatcher_, self.adapter_profiles)
@@ -261,19 +266,23 @@ class PipeExecutor(Executor):
 
         msg_id = message.msg_id_
 
-        assert msg_id in self.backward_cache_
+        tn = message.model_data_.task_name_[0]
+        key = (tn, msg_id)
 
-        phony: torch.Tensor = self.backward_cache_[msg_id]
+        assert key in self.backward_cache_
+
+        phony: torch.Tensor = self.backward_cache_.pop(key)
         phony.grad_fn.grad_from_next_worker = message.tensor_data_  # type: ignore
 
-        tn = message.model_data_.task_name_[0]
         slot = self.task_slot[tn]
-        recv_stream, _, _ = self.stream_pools[slot]
+        _, comp_stream, _ = self.stream_pools[slot]
 
-        with torch.cuda.stream(recv_stream.stream_):
+        gradient_tensor = message.tensor_data_.to(self.device_)
+        phony.grad_fn.grad_from_next_worker = gradient_tensor
+
+        with torch.cuda.stream(comp_stream.stream_):
             phony.backward()
-
-        del self.backward_cache_[msg_id]
+        comp_stream.stream_.synchronize() ##HERE, needs fix
 
         if self.role_ == WorkerRole.HEAD:
             self.__head_process_step(message)
@@ -307,13 +316,13 @@ class PipeExecutor(Executor):
 
         # we need to wait the default stream calcuate all tensor
         # and then send it, so we hook the pre stage fn to poll the stream
-        data.grad_fn.pre_stage_fn = self.default_stream_.poll  # type: ignore
+        data.grad_fn.pre_stage_fn = comp_stream.poll  # type: ignore
         assert message.model_data_ is not None
         
         with torch.cuda.stream(comp_stream.stream_):
             data = self.__forward(data, message.model_data_)
 
-        comp_stream.poll()
+        comp_stream.poll() #Do I need this?
         assert message.model_data_ is not None
         return self.__send_activations(data, message.model_data_)
 
@@ -364,7 +373,7 @@ class PipeExecutor(Executor):
 
         # we need to wait the default stream calcuate all tensor
         # and then send it, so we hook the pre stage fn to poll the stream
-        output.grad_fn.pre_stage_fn = self.default_stream_.poll  # type: ignore
+        output.grad_fn.pre_stage_fn = comp_stream.poll  # type: ignore
 
         assert message.model_data_ is not None
         train_data: MLoRAData = self.input_cache_[message.model_data_.random_id_]
@@ -397,15 +406,13 @@ class PipeExecutor(Executor):
 
         tn = train_data.data_config_[0].task_name_
         slot = self.task_slot[tn]
-        recv_stream, comp_stream, _ = self.stream_pools[slot]
-
-        comp_stream.stream_.wait_stream(recv_stream.stream_)
+        _, comp_stream, _ = self.stream_pools[slot]
 
         with torch.cuda.stream(comp_stream.stream_):
             hidden_data = self.__forward(tensor_data, train_data.model_data())
 
         # step2. then send the hidden state to next worker
-        comp_stream.poll()
+        comp_stream.poll() #Do I need this?
         self.__send_activations(hidden_data, train_data.model_data())
 
         # step3. cache the input, we need it to calc the loss
@@ -423,7 +430,7 @@ class PipeExecutor(Executor):
         _, comp_stream, send_stream = self.stream_pools[slot]
 
         send_stream.stream_.wait_stream(comp_stream.stream_)
-        send_stream.stream_.wait_stream(self.default_stream_.stream_) ##FIXME
+        # send_stream.stream_.wait_stream(self.default_stream_.stream_) ##FIXME
         ## FIXME I'm still missing a comp_stream somewhere! nothing should be running on the default stream?
 
         with torch.cuda.stream(send_stream.stream_):
@@ -435,7 +442,8 @@ class PipeExecutor(Executor):
                 batch_data,
             )
 
-        self.backward_cache_[msg_id] = phony
+        tn = batch_data.task_name_[0]
+        self.backward_cache_[(tn, msg_id)] = phony
 
     def __send_comm(self, data: Any):
         self.transport_.send_comm(PipeMessageType.COMM, data)
@@ -500,6 +508,14 @@ class PipeExecutor(Executor):
         if self.role_ != WorkerRole.TAIL:
             self.__send_comm({"comm": "task_ready", "data": task.task_name()})
 
+        if task.task_name() in self.task_slot:
+            slot = self.task_slot[task.task_name()]
+            recv_stream, comp_stream, send_stream = self.stream_pools[slot]
+
+            recv_stream.stream_.synchronize()
+            comp_stream.stream_.synchronize()
+            send_stream.stream_.synchronize()
+
         for adapter_name in task.adapter_name():
             for partial_layer in self.partial_model_:
                 if partial_layer.name() != "Decoder":
@@ -514,6 +530,12 @@ class PipeExecutor(Executor):
 
         slot = self.task_slot.pop(task.task_name(), None)
         if slot is not None:
+            recv_stream, comp_stream, send_stream = self.stream_pools[slot]
+
+            recv_stream.stream_.synchronize()
+            comp_stream.stream_.synchronize()
+            send_stream.stream_.synchronize()
+
             self.stream_taken[slot] = False
 
         task.switch_device("cpu")
@@ -528,6 +550,16 @@ class PipeExecutor(Executor):
         logging.info(f"Task - {task.task_name()} terminate.")
         if self.role_ != WorkerRole.TAIL:
             self.__send_comm({"comm": "task_terminal", "data": task.task_name()})
+
+        slot = self.task_slot.pop(task.task_name(), None)
+        if slot is not None:
+            recv_stream, comp_stream, send_stream = self.stream_pools[slot]
+
+            recv_stream.stream_.synchronize()
+            comp_stream.stream_.synchronize()
+            send_stream.stream_.synchronize()
+
+            self.stream_taken[slot] = False
 
         task.switch_device("cpu")
         for adapter_name in task.adapter_name():
