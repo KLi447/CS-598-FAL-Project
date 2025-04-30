@@ -3,6 +3,7 @@ import mlora.utils
 import mlora.executor
 import mlora.config
 import logging
+import argparse
 
 def setup_logging():
     logging.basicConfig(
@@ -14,17 +15,24 @@ def main():
     # Setup logging
     setup_logging()
     
+    # Parse command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base_model", type=str, required=True, help="Path to base model")
+    parser.add_argument("--config", type=str, required=True, help="Path to config file")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
+    parser.add_argument("--precision", type=str, default="fp32", help="Precision to use")
+    args = parser.parse_args()
+    
     # Set random seed for reproducibility
     mlora.utils.setup_seed(42)
     
     # Load model and tokenizer
     logging.info("Loading model and tokenizer...")
-    args = mlora.utils.get_cmd_args()
     tokenizer, model = mlora.model.load_model(args)
     
     # Load configuration
     logging.info("Loading configuration...")
-    config = mlora.config.MLoRAConfig("patent_classification.yaml")
+    config = mlora.config.MLoRAConfig(args.config)
     
     # Initialize executor
     logging.info("Initializing executor...")
@@ -44,4 +52,4 @@ def main():
 if __name__ == "__main__":
     main() 
 
-#python train_patent.py --config patent_classification.yaml
+#ppython train_patent.py --base_model TinyLlama/TinyLlama-1.1B-Chat-v0.4 --config patent_classification.yaml --device cuda:0 --precision fp32

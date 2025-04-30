@@ -1,44 +1,41 @@
-model:
-  name: "llama2-7b"  # or your base model name
-  path: "path/to/your/model"
+dispatcher:
+  name: "default"
+  concurrency_num: 2
+
+datasets:
+  - name: "patent_data"
+    data: "data/patent-classification"
+    prompt: "demo/prompt.yaml"
+    prompt_type: "instruction"
+    preprocess: "shuffle"
+    text_column: "text"
+    label_column: "label"
 
 adapters:
   - name: "patent_classifier_lora"
     type: "lora"
-    rank: 8
-    alpha: 16
-    dropout: 0.1
-    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
-    bias: "none"
-
-datasets:
-  - name: "patent_classification"
-    type: "classification"
-    path: "data/patent-classification"
-    split: "train"
-    max_length: 512
-    text_column: "text"
-    label_column: "label"
+    path: "adapters/patent_classifier"
+    optimizer: "adamw"
+    lr: 3e-4
+    r: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules:
+      q_proj: true
+      k_proj: true
+      v_proj: true
+      o_proj: true
+      gate_proj: false
+      down_proj: false
+      up_proj: false
 
 tasks:
-  - name: "patent_classification_task"
-    type: "train"
+  - type: "train"
+    name: "patent_classification_task"
     adapter: "patent_classifier_lora"
-    dataset: "patent_classification"
-    batch_size: 32
-    mini_batch_size: 8
-    num_epochs: 5
-    cutoff_len: 512
-    save_step: 1000
-
-optimizer:
-  type: "adamw"
-  lr: 1e-4
-  weight_decay: 0.01
-  betas: [0.9, 0.999]
-  eps: 1e-8
-
-lr_scheduler:
-  type: "cosine"
-  warmup_steps: 100
-  total_steps: 5000 
+    dataset: "patent_data"
+    batch_size: 64
+    mini_batch_size: 64
+    num_epochs: 10
+    cutoff_len: 256
+    save_step: 2000 
