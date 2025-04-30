@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
     parser.add_argument("--precision", type=str, default="fp32", help="Precision to use")
     parser.add_argument("--model_type", type=str, default="llama", help="Type of model (llama)")
+    parser.add_argument("--pipeline", action="store_true", help="Whether to use pipeline parallelism")
     args = parser.parse_args()
     
     # Set random seed for reproducibility
