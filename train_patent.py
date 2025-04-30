@@ -21,6 +21,7 @@ def main():
     parser.add_argument("--config", type=str, required=True, help="Path to config file")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use")
     parser.add_argument("--precision", type=str, default="fp32", help="Precision to use")
+    arser.add_argument("--model_type", type=str, default="llama", help="Type of model (llama)")
     args = parser.parse_args()
     
     # Set random seed for reproducibility
@@ -52,4 +53,4 @@ def main():
 if __name__ == "__main__":
     main() 
 
-#ppython train_patent.py --base_model TinyLlama/TinyLlama-1.1B-Chat-v0.4 --config patent_classification.yaml --device cuda:0 --precision fp32
+#python train_patent.py --base_model TinyLlama/TinyLlama-1.1B-Chat-v0.4 --config patent_classification.yaml --device cuda:0 --precision fp32
