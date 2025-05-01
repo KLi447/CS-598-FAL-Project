@@ -52,7 +52,6 @@ adapters:
 
 tasks:
   # QK-only experiment
-  # Experiment 1: QK-only
   - type: "dpo"
     name: "exp1_qk_only"
     adapter: "lora_qk"
@@ -62,19 +61,13 @@ tasks:
     mini_batch_size: 16
     num_epochs: 2
     cutoff_len: 256
-    save_step: 50  # Save more frequently for analysis
-    eval_step: 50  # Evaluate more frequently
+    save_step: 50
+    eval_step: 50
     loss_type: "sigmoid"
     beta: 0.1
     label_smoothing: 0.0
-    metrics:
-      - "loss"
-      - "reward_chosen"
-      - "reward_rejected"
-      - "gpu_memory"
-      - "training_time"
 
-  # Experiment 2: VO-only
+  # VO-only experiment
   - type: "dpo"
     name: "exp1_vo_only"
     adapter: "lora_vo"
@@ -89,33 +82,3 @@ tasks:
     loss_type: "sigmoid"
     beta: 0.1
     label_smoothing: 0.0
-    metrics:
-      - "loss"
-      - "reward_chosen"
-      - "reward_rejected"
-      - "gpu_memory"
-      - "training_time" 
-  
-  # Experiment 3: Combined QK and VO
-  - type: "dpo"
-    name: "exp1_combined"
-    adapter:
-      reward_adapter: "lora_qk"
-      actor_adapter: "lora_vo"
-    reference: "base"
-    dataset: "dpo_data"
-    batch_size: 16
-    mini_batch_size: 16
-    num_epochs: 2
-    cutoff_len: 256
-    save_step: 50
-    eval_step: 50
-    loss_type: "sigmoid"
-    beta: 0.1
-    label_smoothing: 0.0
-    metrics:
-      - "loss"
-      - "reward_chosen"
-      - "reward_rejected"
-      - "gpu_memory"
-      - "training_time"
