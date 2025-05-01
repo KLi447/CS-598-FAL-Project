@@ -168,7 +168,7 @@ __pycache__/
 *.egg
 
 data/*
-adapters/*
+
 
 # macOS junk files
 .DS_Store
