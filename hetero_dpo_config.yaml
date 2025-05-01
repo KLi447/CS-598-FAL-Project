@@ -1,6 +1,8 @@
 dispatcher:
   name: "default"
   concurrency_num: 2
+  log_level: "DEBUG"  # More detailed logging
+  metrics_log: true   # Enable metrics logging
 
 datasets:
   - name: "dpo_data"
@@ -11,10 +13,10 @@ datasets:
     max_samples: 1000
 
 adapters:
-  # First LoRA adapter for query and key projections
+  # QK adapter (rank 16)
   - name: "lora_qk"
     type: "lora"
-    path: "adapters/lora_qk"
+    path: "adapters/exp1_lora_qk"
     optimizer: "adamw"
     lr: 3e-4
     r: 16
@@ -29,10 +31,10 @@ adapters:
       down_proj: false
       up_proj: false
 
-  # Second LoRA adapter for value and output projections
+  # VO adapter (rank 32)
   - name: "lora_vo"
     type: "lora"
-    path: "adapters/lora_vo"
+    path: "adapters/exp1_lora_vo"
     optimizer: "adamw"
     lr: 3e-4
     r: 32
@@ -48,16 +50,36 @@ adapters:
       up_proj: false
 
 tasks:
+  # QK-only experiment
   - type: "dpo"
-    name: "task_0"
-    adapter: "lora_qk"  # Primary adapter
-    reference: "base"  # Using base model as reference
+    name: "exp1_qk_only"
+    adapter: "lora_qk"
+    reference: "base"
     dataset: "dpo_data"
     batch_size: 16
     mini_batch_size: 16
-    num_epochs: 4
+    num_epochs: 2
     cutoff_len: 256
-    save_step: 2000
+    save_step: 100  # More frequent checkpoints
     loss_type: "sigmoid"
     beta: 0.1
-    label_smoothing: 0.0 
+    label_smoothing: 0.0
+    log_attention: true  # Log attention patterns
+    profile_memory: true # Track memory usage
+
+  # VO-only experiment
+  - type: "dpo"
+    name: "exp1_vo_only"
+    adapter: "lora_vo"
+    reference: "base"
+    dataset: "dpo_data"
+    batch_size: 16
+    mini_batch_size: 16
+    num_epochs: 2
+    cutoff_len: 256
+    save_step: 100
+    loss_type: "sigmoid"
+    beta: 0.1
+    label_smoothing: 0.0
+    log_attention: true
+    profile_memory: true 
