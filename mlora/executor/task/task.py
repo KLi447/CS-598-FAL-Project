@@ -22,6 +22,13 @@ from mlora.model.modules import AdapterModel
 from mlora.model.tokenizer import Tokenizer
 from mlora.prompter import Prompter, PrompterFactory
 
+# Import task classes first
+from .train_task import TrainTask
+from .cpo_task import CPOTask
+from .ppo_task import PPOTask
+from .cit_task import CITTask
+from .dpo_task import DPOTask
+
 TASKCONFIG_CLASS: Dict[str, type] = {
     "train": TrainTaskConfig,
     "cpo": CPOTaskConfig,
