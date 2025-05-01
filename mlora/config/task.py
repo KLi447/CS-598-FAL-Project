@@ -1,9 +1,16 @@
 import logging
 from typing import Dict, Mapping, Optional, Type
+from dataclasses import dataclass
 
 from .adapter import AdapterConfig
 from .config import DictConfig
 from .dataset import DatasetConfig
+from .train import TrainTaskConfig
+from .cpo import CPOTaskConfig
+from .ppo import PPOTaskConfig
+from .cit import CITTaskConfig
+from .dpo import DPOTaskConfig
+from .patent import PatentTaskConfig
 
 
 class TaskConfig(DictConfig):
@@ -216,10 +223,23 @@ class PPOTaskConfig(TrainTaskConfig):
             self.reference_ = adapters[config["reference"]]
 
 
-TASKCONFIG_CLASS: Dict[str, Type[TaskConfig]] = {
+class PatentTaskConfig(TaskConfig):
+    # Add any necessary attributes for PatentTaskConfig
+    pass
+
+
+TASKCONFIG_CLASS: Dict[str, Type["TaskConfig"]] = {
     "train": TrainTaskConfig,
-    "dpo": DPOTaskConfig,
     "cpo": CPOTaskConfig,
-    "cit": CITTaskConfig,
     "ppo": PPOTaskConfig,
+    "cit": CITTaskConfig,
+    "dpo": DPOTaskConfig,
+    "patent": PatentTaskConfig,
 }
+
+@dataclass
+class TaskConfig:
+    type_: str
+    name_: str
+    adapter_: AdapterConfig
+    dataset_: Optional[DatasetConfig] = None
