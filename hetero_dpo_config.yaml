@@ -4,7 +4,7 @@ dispatcher:
 
 datasets:
   - name: "dpo_data"
-    data: "Anthropic/hh-rlhf"
+    data: "data/hh-rlhf/train.json"
     prompt: "prompts/dpo_prompt.yaml"
     prompt_type: "preference"
     preprocess: "default"
