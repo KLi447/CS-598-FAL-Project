@@ -1,8 +1,9 @@
 dispatcher:
   name: "default"
-  concurrency_num: 2
+  concurrency_num: 1
   log_level: "DEBUG"  # More detailed logging
   metrics_log: true   # Enable metrics logging
+  log_dir: "experiment_logs"
 
 datasets:
   - name: "dpo_data"
@@ -10,7 +11,7 @@ datasets:
     prompt: "prompts/dpo_prompt.yaml"
     prompt_type: "preference"
     preprocess: "default"
-    max_samples: 1000
+
 
 adapters:
   # QK adapter (rank 16)
@@ -51,6 +52,7 @@ adapters:
 
 tasks:
   # QK-only experiment
+  # Experiment 1: QK-only
   - type: "dpo"
     name: "exp1_qk_only"
     adapter: "lora_qk"
@@ -60,14 +62,18 @@ tasks:
     mini_batch_size: 16
     num_epochs: 2
     cutoff_len: 256
-    save_step: 100  # More frequent checkpoints
+    save_step: 50  # Save more frequently for analysis
+    eval_step: 50  # Evaluate more frequently
     loss_type: "sigmoid"
     beta: 0.1
-    label_smoothing: 0.0
-    log_attention: true  # Log attention patterns
-    profile_memory: true # Track memory usage
+    metrics:
+      - "loss"
+      - "reward_chosen"
+      - "reward_rejected"
+      - "gpu_memory"
+      - "training_time"
 
-  # VO-only experiment
+  # Experiment 2: VO-only
   - type: "dpo"
     name: "exp1_vo_only"
     adapter: "lora_vo"
@@ -77,9 +83,34 @@ tasks:
     mini_batch_size: 16
     num_epochs: 2
     cutoff_len: 256
-    save_step: 100
+    save_step: 50
+    eval_step: 50
     loss_type: "sigmoid"
     beta: 0.1
-    label_smoothing: 0.0
-    log_attention: true
-    profile_memory: true 
+    metrics:
+      - "loss"
+      - "reward_chosen"
+      - "reward_rejected"
+      - "gpu_memory"
+      - "training_time" 
+  
+  # Experiment 3: Combined QK and VO
+  - type: "dpo"
+    name: "exp1_combined"
+    adapter: ["lora_qk", "lora_vo"]
+    reference: "base"
+    dataset: "dpo_data"
+    batch_size: 16
+    mini_batch_size: 16
+    num_epochs: 2
+    cutoff_len: 256
+    save_step: 50
+    eval_step: 50
+    loss_type: "sigmoid"
+    beta: 0.1
+    metrics:
+      - "loss"
+      - "reward_chosen"
+      - "reward_rejected"
+      - "gpu_memory"
+      - "training_time"
