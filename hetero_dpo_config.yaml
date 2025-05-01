@@ -4,8 +4,7 @@ dispatcher:
 
 datasets:
   - name: "dpo_data"
-    data: "huggingface:Anthropic/hh-rlhf"  # Using the Anthropic HH-RLHF dataset
-    prompt: "prompts/dpo_prompt.yaml"
+    data: "Anthropic/hh-rlhf"    prompt: "prompts/dpo_prompt.yaml"
     prompt_type: "preference"
     preprocess: "default"
 
