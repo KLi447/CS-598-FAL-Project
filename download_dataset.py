@@ -1,8 +1,9 @@
 from datasets import load_dataset
 
-# Download the dataset
-dataset = load_dataset("Anthropic/hh-rlhf")
+# Download only 1000 examples from each split
+train_dataset = load_dataset("Anthropic/hh-rlhf", split="train[:2500]")
+test_dataset = load_dataset("Anthropic/hh-rlhf", split="test[:1500]")  # smaller test set
 
 # Save to local JSON files
-dataset["train"][:3000].to_json("data/hh-rlhf/train.json")
-dataset["test"][:1500].to_json("data/hh-rlhf/test.json")
+train_dataset.to_json("data/hh-rlhf/train.json")
+test_dataset.to_json("data/hh-rlhf/test.json")
