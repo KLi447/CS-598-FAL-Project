@@ -14,6 +14,7 @@ from mlora.model.args import LinearInfo, Masks, MLoRADataConfig, Tokens
 from mlora.model.modules import AdapterModel
 from mlora.model.tokenizer import Tokenizer
 from mlora.prompter import Prompter, PrompterFactory
+from .hf_task import HFTask
 
 
 class Task:

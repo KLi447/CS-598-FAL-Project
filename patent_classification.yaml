@@ -15,6 +15,7 @@ datasets:
     instruction: "Classify the following patent text into one of the IPC classes:"
     input_template: "Patent text: {text}"
     output_template: "IPC class: {label}"
+    data_files: null
 
 adapters:
   - name: "patent_classifier_lora"
@@ -35,7 +36,7 @@ adapters:
       up_proj: false
 
 tasks:
-  - type: "train"
+  - type: "hf"
     name: "patent_classification_task"
     adapter: "patent_classifier_lora"
     dataset: "patent_data"
