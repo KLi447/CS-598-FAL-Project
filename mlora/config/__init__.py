@@ -19,7 +19,6 @@ from .task import (
     PPOTaskConfig,
     TaskConfig,
     TrainTaskConfig,
-    PatentTaskConfig
 )
 
 __all__ = [
@@ -42,5 +41,4 @@ __all__ = [
     "LRSchedulerConfig",
     "PPOTaskConfig",
     "FloraPerExampleConfig",
-    "PatentTaskConfig",
 ]

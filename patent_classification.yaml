@@ -1,47 +1,53 @@
 dispatcher:
-  name: "default"
-  concurrency_num: 2
+  type: "train"
+  name: "patent_classification_dispatcher"
+  device: "cuda:0"
+  precision: "fp32"
+  batch_size: 8
+  mini_batch_size: 2
+  accumulate_step: 4
+  num_epochs: 3
+  cutoff_len: 512
+  save_step: 1000
+  compute_cost: 8.0
 
 datasets:
-  - name: "patent_data"
-    data: "ccdv/patent-classification"
-    data_type: "huggingface"
-    subset: "patent"
-    prompt: "demo/prompt.yaml"
-    prompt_type: "instruction"
+  patent_train:
+    name: "patent_train"
+    type: "train"
+    data_path: "data/patent/train.json"
     preprocess: "shuffle"
     text_column: "text"
     label_column: "label"
-    instruction: "Classify the following patent text into one of the IPC classes:"
-    input_template: "Patent text: {text}"
-    output_template: "IPC class: {label}"
-    data_files: null
+  
+  patent_validation:
+    name: "patent_validation"
+    type: "train"
+    data_path: "data/patent/validation.json"
+    preprocess: "default"
+    text_column: "text"
+    label_column: "label"
 
 adapters:
-  - name: "patent_classifier_lora"
+  patent_classifier_lora:
+    name: "patent_classifier_lora"
     type: "lora"
-    path: "adapters/patent_classifier"
-    optimizer: "adamw"
-    lr: 3e-4
-    r: 32
-    alpha: 64
-    dropout: 0.05
-    target_modules:
-      q_proj: true
-      k_proj: true
-      v_proj: true
-      o_proj: true
-      gate_proj: false
-      down_proj: false
-      up_proj: false
+    rank: 8
+    alpha: 16
+    dropout: 0.1
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+    bias: "none"
+    task_type: "CAUSAL_LM"
 
 tasks:
-  - type: "patent"
-    name: "patent_classification_task"
+  patent_train_task:
+    type: "train"
+    name: "patent_train_task"
     adapter: "patent_classifier_lora"
-    dataset: "patent_data"
-    batch_size: 64
-    mini_batch_size: 64
-    num_epochs: 10
-    cutoff_len: 256
-    save_step: 2000 
+    dataset: "patent_train"
+  
+  patent_validation_task:
+    type: "train"
+    name: "patent_validation_task"
+    adapter: "patent_classifier_lora"
+    dataset: "patent_validation" 

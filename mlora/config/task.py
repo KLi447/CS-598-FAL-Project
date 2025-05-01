@@ -10,7 +10,6 @@ from .cpo import CPOTaskConfig
 from .ppo import PPOTaskConfig
 from .cit import CITTaskConfig
 from .dpo import DPOTaskConfig
-from .patent import PatentTaskConfig
 
 
 class TaskConfig(DictConfig):
@@ -223,18 +222,12 @@ class PPOTaskConfig(TrainTaskConfig):
             self.reference_ = adapters[config["reference"]]
 
 
-class PatentTaskConfig(TaskConfig):
-    # Add any necessary attributes for PatentTaskConfig
-    pass
-
-
 TASKCONFIG_CLASS: Dict[str, Type["TaskConfig"]] = {
     "train": TrainTaskConfig,
     "cpo": CPOTaskConfig,
     "ppo": PPOTaskConfig,
     "cit": CITTaskConfig,
     "dpo": DPOTaskConfig,
-    "patent": PatentTaskConfig,
 }
 
 @dataclass
