@@ -1,9 +1,9 @@
 template: |
   ### Instruction:
-  {{ data_point['instruction'] + '\n'}}
-  {% if 'input' in data_point %}
+  {{ instruction }}
+
   ### Input:
-  {{ data_point['input'] + '\n'}}
-  {% endif %}
+  {{ input_template.format(text=data_point[text_column]) }}
+
   ### Output:
-  {{ data_point['chosen'] + '\n'}}
+  {{ output_template.format(label=data_point[label_column]) }}

@@ -4,14 +4,17 @@ dispatcher:
 
 datasets:
   - name: "patent_data"
-    data: "ccdv/patent-classification"  # Changed this line to use HF dataset ID
-    data_type: "huggingface"  # Added this line to specify it's a HF dataset
-    subset: "patent"  # Added this line to specify the subset
+    data: "ccdv/patent-classification"
+    data_type: "huggingface"
+    subset: "patent"
     prompt: "demo/prompt.yaml"
     prompt_type: "instruction"
     preprocess: "shuffle"
     text_column: "text"
     label_column: "label"
+    instruction: "Classify the following patent text into one of the IPC classes:"
+    input_template: "Patent text: {text}"
+    output_template: "IPC class: {label}"
 
 adapters:
   - name: "patent_classifier_lora"
