@@ -17,7 +17,7 @@ adapters:
   # QK adapter (rank 16)
   - name: "lora_qk"
     type: "lora"
-    path: "adapters/exp1_lora_qk"
+    path: "adapters/exp1_qk"
     optimizer: "adamw"
     lr: 3e-4
     r: 16
@@ -35,7 +35,7 @@ adapters:
   # VO adapter (rank 32)
   - name: "lora_vo"
     type: "lora"
-    path: "adapters/exp1_lora_vo"
+    path: "adapters/exp1_vo"
     optimizer: "adamw"
     lr: 3e-4
     r: 32
@@ -99,7 +99,9 @@ tasks:
   # Experiment 3: Combined QK and VO
   - type: "dpo"
     name: "exp1_combined"
-    adapter: ["lora_qk", "lora_vo"]
+    adapter:
+      reward_adapter: "lora_qk"
+      actor_adapter: "lora_vo"
     reference: "base"
     dataset: "dpo_data"
     batch_size: 16
