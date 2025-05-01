@@ -9,11 +9,9 @@ from mlora.config import TaskConfig
 from mlora.model.args import LinearInfo, Tokens
 from mlora.model.tokenizer import Tokenizer
 from mlora.prompter import Prompter, PrompterFactory
+from mlora.executor.task.task import Task
 
-# Move Task import to the bottom to avoid circular import
-from .task import Task
-
-class HFTask(Task):
+class PatentTask(Task):
     def _pre_dataset(self):
         preprocess_func: Dict[str, Callable] = {
             "default": lambda data: data,

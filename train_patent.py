@@ -4,6 +4,8 @@ import mlora.executor
 import mlora.config
 import logging
 import argparse
+from mlora.executor.task.patent_task import PatentTask
+from mlora.executor.task.task import TASK_CLASS
 
 def setup_logging():
     logging.basicConfig(
@@ -14,6 +16,9 @@ def setup_logging():
 def main():
     # Setup logging
     setup_logging()
+    
+    # Register our custom task type
+    TASK_CLASS["patent"] = PatentTask
     
     # Parse command line arguments
     parser = argparse.ArgumentParser()

@@ -36,7 +36,7 @@ adapters:
       up_proj: false
 
 tasks:
-  - type: "hf"
+  - type: "patent"
     name: "patent_classification_task"
     adapter: "patent_classifier_lora"
     dataset: "patent_data"

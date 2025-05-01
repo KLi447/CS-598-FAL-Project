@@ -8,14 +8,38 @@ from typing import Callable, Dict, List, Optional, Tuple
 from datasets import load_dataset
 from tqdm import tqdm
 
-from mlora.config import TaskConfig
+from mlora.config import (
+    TaskConfig,
+    TrainTaskConfig,
+    InferenceTaskConfig,
+    BenchmarkTaskConfig,
+    PPOTaskConfig,
+    CPOTaskConfig,
+    MultitaskConfig
+)
 from mlora.executor.context import TRAINCONTEXT_CLASS, TaskContext
 from mlora.model.args import LinearInfo, Masks, MLoRADataConfig, Tokens
 from mlora.model.modules import AdapterModel
 from mlora.model.tokenizer import Tokenizer
 from mlora.prompter import Prompter, PrompterFactory
-from .hf_task import HFTask
 
+TASKCONFIG_CLASS: Dict[str, type] = {
+    "train": TrainTaskConfig,
+    "inference": InferenceTaskConfig,
+    "benchmark": BenchmarkTaskConfig,
+    "ppo": PPOTaskConfig,
+    "cpo": CPOTaskConfig,
+    "multitask": MultitaskConfig,
+}
+
+TASK_CLASS: Dict[str, type] = {
+    "train": TrainTask,
+    "inference": InferenceTask,
+    "benchmark": BenchmarkTask,
+    "ppo": PPOTask,
+    "cpo": CPOTask,
+    "multitask": MultitaskTask,
+}
 
 class Task:
     config_: TaskConfig
