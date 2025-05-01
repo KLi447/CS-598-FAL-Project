@@ -1,0 +1,167 @@
+dispatcher:
+  name: "default"
+  concurrency_num: 1
+  log_level: "DEBUG"
+  metrics_log: true
+  log_dir: "experiment_logs"
+
+datasets:
+  - name: "dpo_data"
+    data: "data/hh-rlhf/train.json"
+    prompt: "prompts/dpo_prompt.yaml"
+    prompt_type: "preference"
+    preprocess: "default"
+
+adapters:
+  # Reward adapter
+  - name: "reward_adapter"
+    type: "lora"
+    path: "adapters/reward"
+    optimizer: "adamw"
+    lr: 3e-4
+    r: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules:
+      q_proj: true
+      k_proj: true
+      v_proj: true
+      o_proj: true
+      gate_proj: false
+      down_proj: false
+      up_proj: false
+
+  # Actor adapter
+  - name: "actor_adapter"
+    type: "lora"
+    path: "adapters/actor"
+    optimizer: "adamw"
+    lr: 3e-4
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      q_proj: true
+      k_proj: true
+      v_proj: true
+      o_proj: true
+      gate_proj: true
+      down_proj: true
+      up_proj: true
+
+  # Critic adapter
+  - name: "critic_adapter"
+    type: "lora"
+    path: "adapters/critic"
+    optimizer: "adamw"
+    lr: 3e-4
+    r: 24
+    alpha: 48
+    dropout: 0.05
+    target_modules:
+      q_proj: true
+      k_proj: true
+      v_proj: true
+      o_proj: true
+      gate_proj: false
+      down_proj: false
+      up_proj: false
+
+tasks:
+  # Individual training tasks
+  - type: "ppo"
+    name: "reward_only"
+    adapter:
+      reward_adapter: "reward_adapter"
+      actor_adapter: "reward_adapter"
+      critic_adapter: "reward_adapter"
+    reference: "base"
+    dataset: "dpo_data"
+    batch_size: 16
+    mini_batch_size: 16
+    num_epochs: 2
+    cutoff_len: 256
+    save_step: 50
+    eval_step: 50
+    gamma: 0.99
+    lamdb: 0.95
+    K_epochs: 5
+    optim_num: 1
+    critic_loss_type: "mse"
+    actor_loss_type: "clip"
+    reward_loss_type: "mse"
+    generate_num: 1
+    kl_coefficient: 0.1
+
+  - type: "ppo"
+    name: "critic_only"
+    adapter:
+      reward_adapter: "critic_adapter"
+      actor_adapter: "critic_adapter"
+      critic_adapter: "critic_adapter"
+    reference: "base"
+    dataset: "dpo_data"
+    batch_size: 16
+    mini_batch_size: 16
+    num_epochs: 2
+    cutoff_len: 256
+    save_step: 50
+    eval_step: 50
+    gamma: 0.99
+    lamdb: 0.95
+    K_epochs: 5
+    optim_num: 1
+    critic_loss_type: "mse"
+    actor_loss_type: "clip"
+    reward_loss_type: "mse"
+    generate_num: 1
+    kl_coefficient: 0.1
+
+  - type: "ppo"
+    name: "actor_only"
+    adapter:
+      reward_adapter: "actor_adapter"
+      actor_adapter: "actor_adapter"
+      critic_adapter: "actor_adapter"
+    reference: "base"
+    dataset: "dpo_data"
+    batch_size: 16
+    mini_batch_size: 16
+    num_epochs: 2
+    cutoff_len: 256
+    save_step: 50
+    eval_step: 50
+    gamma: 0.99
+    lamdb: 0.95
+    K_epochs: 5
+    optim_num: 1
+    critic_loss_type: "mse"
+    actor_loss_type: "clip"
+    reward_loss_type: "mse"
+    generate_num: 1
+    kl_coefficient: 0.1
+
+  # Combined training task
+  - type: "ppo"
+    name: "combined_ppo"
+    adapter:
+      reward_adapter: "reward_adapter"
+      actor_adapter: "actor_adapter"
+      critic_adapter: "critic_adapter"
+    reference: "base"
+    dataset: "dpo_data"
+    batch_size: 16
+    mini_batch_size: 16
+    num_epochs: 2
+    cutoff_len: 256
+    save_step: 50
+    eval_step: 50
+    gamma: 0.99
+    lamdb: 0.95
+    K_epochs: 5
+    optim_num: 1
+    critic_loss_type: "mse"
+    actor_loss_type: "clip"
+    reward_loss_type: "mse"
+    generate_num: 1
+    kl_coefficient: 0.1
