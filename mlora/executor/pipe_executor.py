@@ -1,6 +1,7 @@
 import logging
 import time
 import uuid
+import threading
 from enum import Enum, auto
 from typing import Any, Dict, List, OrderedDict, Tuple, cast
 from dataclasses import dataclass
@@ -60,6 +61,7 @@ class PipeExecutor(Executor):
     stream_pools: List[Tuple[CudaStream, CudaStream, CudaStream]]
     stream_taken: List[bool]
     task_slot: Dict[str, int]
+    slot_lock: threading.Lock
 
     def __init__(
         self,
@@ -81,6 +83,8 @@ class PipeExecutor(Executor):
         self.rank_ = rank
         self.world_size_ = nodes
 
+        self.slot_lock = threading.Lock()
+
         self.backward_cache_ = {}
         self.input_cache_ = {}
 
@@ -94,6 +98,8 @@ class PipeExecutor(Executor):
         self.default_stream_ = CudaStream(torch.cuda.default_stream(self.device_))
         
         n = len(self.mlora_config.adapters().items())
+        # n = config.dispatcher_.concurrency_num_
+
         self.stream_pools = []
         self.stream_taken = [False] * n
         for _ in range(n):
@@ -109,7 +115,7 @@ class PipeExecutor(Executor):
             self.rank_, self.world_size_, torch.device(self.device_)
         )
 
-        config.dispatcher_.concurrency_num_ = n # eventually I should get rid of the logic to process this entirely
+        # config.dispatcher_.concurrency_num_ = n # eventually I should get rid of the logic to process this entirely
 
         self.dispatcher_: PipeDispatcher = cast(
             PipeDispatcher, DISPATCHER_CLASS["pipe"](config.dispatcher_, self.adapter_profiles)
@@ -316,13 +322,13 @@ class PipeExecutor(Executor):
 
         # we need to wait the default stream calcuate all tensor
         # and then send it, so we hook the pre stage fn to poll the stream
-        data.grad_fn.pre_stage_fn = comp_stream.poll  # type: ignore
+        # data.grad_fn.pre_stage_fn = comp_stream.poll  # type: ignore
         assert message.model_data_ is not None
         
         with torch.cuda.stream(comp_stream.stream_):
             data = self.__forward(data, message.model_data_)
 
-        comp_stream.poll() #Do I need this?
+        comp_stream.poll()
         assert message.model_data_ is not None
         return self.__send_activations(data, message.model_data_)
 
@@ -373,7 +379,7 @@ class PipeExecutor(Executor):
 
         # we need to wait the default stream calcuate all tensor
         # and then send it, so we hook the pre stage fn to poll the stream
-        output.grad_fn.pre_stage_fn = comp_stream.poll  # type: ignore
+        # output.grad_fn.pre_stage_fn = comp_stream.poll  # type: ignore
 
         assert message.model_data_ is not None
         train_data: MLoRAData = self.input_cache_[message.model_data_.random_id_]
@@ -412,7 +418,7 @@ class PipeExecutor(Executor):
             hidden_data = self.__forward(tensor_data, train_data.model_data())
 
         # step2. then send the hidden state to next worker
-        comp_stream.poll() #Do I need this?
+        comp_stream.poll()
         self.__send_activations(hidden_data, train_data.model_data())
 
         # step3. cache the input, we need it to calc the loss
@@ -430,8 +436,6 @@ class PipeExecutor(Executor):
         _, comp_stream, send_stream = self.stream_pools[slot]
 
         send_stream.stream_.wait_stream(comp_stream.stream_)
-        # send_stream.stream_.wait_stream(self.default_stream_.stream_) ##FIXME
-        ## FIXME I'm still missing a comp_stream somewhere! nothing should be running on the default stream?
 
         with torch.cuda.stream(send_stream.stream_):
             phony: torch.Tensor = SendOperator.apply(
@@ -482,26 +486,29 @@ class PipeExecutor(Executor):
         )
         task.prepare(self.__linears_info(), self.tokenizer_)
 
-    def __task_to_running_hook(self, task: Task):
-        logging.info(f"Task to running, need to load adapters: {task.adapter_name()}")
-        if self.role_ != WorkerRole.TAIL:
-            self.__send_comm({"comm": "task_running", "data": task.task_name()})
-
-        for i, in_use in enumerate(self.stream_taken):
-            logging.info(f"i: {i}, in use: {in_use}")
-            if not in_use:
-                self.stream_taken[i]      = True
-                self.task_slot[task.task_name()] = i
-                break
-        else:
-            raise RuntimeError("No free stream slot for new task") #should never happen
-
         task.switch_device(self.device_)
         for adapter_model in task.adapter_model():
             for partial_layer in self.partial_model_:
                 if partial_layer.name() != "Decoder":
                     continue
                 partial_layer.wrapper_module_.load_adapter(adapter_model)
+
+    def __task_to_running_hook(self, task: Task):
+        logging.info(f"Task to running, need to load adapters: {task.adapter_name()}")
+        if self.role_ != WorkerRole.TAIL:
+            self.__send_comm({"comm": "task_running", "data": task.task_name()})
+        
+        with self.slot_lock:
+            for i, in_use in enumerate(self.stream_taken):
+                logging.info(f"i: {i}, in use: {in_use}")
+                if not in_use:
+                    self.stream_taken[i]      = True
+                    self.task_slot[task.task_name()] = i
+                    break
+            else:
+                raise RuntimeError("No free stream slot for new task") #should never happen
+
+        task.switch_device(self.device_)
 
     def __task_to_ready_hook(self, task: Task):
         logging.info(f"Base model offload adapters: {task.adapter_name()}")
@@ -516,12 +523,7 @@ class PipeExecutor(Executor):
             comp_stream.stream_.synchronize()
             send_stream.stream_.synchronize()
 
-        for adapter_name in task.adapter_name():
-            for partial_layer in self.partial_model_:
-                if partial_layer.name() != "Decoder":
-                    continue
-                partial_layer.wrapper_module_.offload_adapter(adapter_name)
-        task.switch_device("cpu")
+            self.stream_taken[slot] = False
 
     def __task_to_done_hook(self, task: Task):
         logging.info(f"Finish and base model offload adapter - {task.adapter_name()}")
