@@ -8,45 +8,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 from datasets import load_dataset
 from tqdm import tqdm
 
-from mlora.config import (
-    TaskConfig,
-    TrainTaskConfig,
-    CPOTaskConfig,
-    PPOTaskConfig,
-    CITTaskConfig,
-    DPOTaskConfig
-)
+from mlora.config import TaskConfig
 from mlora.executor.context import TRAINCONTEXT_CLASS, TaskContext
 from mlora.model.args import LinearInfo, Masks, MLoRADataConfig, Tokens
 from mlora.model.modules import AdapterModel
 from mlora.model.tokenizer import Tokenizer
 from mlora.prompter import Prompter, PrompterFactory
-
-# Import task classes first
-from .task_base import Task
-from .train_task import TrainTask
-from .cpo_task import CPOTask
-from .ppo_task import PPOTask
-from .cit_task import CITTask
-from .dpo_task import DPOTask
-
-TASKCONFIG_CLASS: Dict[str, type] = {
-    "train": TrainTaskConfig,
-    "cpo": CPOTaskConfig,
-    "ppo": PPOTaskConfig,
-    "cit": CITTaskConfig,
-    "dpo": DPOTaskConfig,
-}
-
-TASK_CLASS: Dict[str, type] = {
-    "train": TrainTask,
-    "cpo": CPOTask,
-    "ppo": PPOTask,
-    "cit": CITTask,
-    "dpo": DPOTask,
-}
-
-__all__ = ["Task", "TASK_CLASS", "TASKCONFIG_CLASS"]
 
 class Task:
     config_: TaskConfig
@@ -235,4 +202,4 @@ class Task:
         return self.config_.name_
 
     def switch_device(self, device: str):
-        self.context_.switch_device(device)
+        self.context_.switch_device(device) 

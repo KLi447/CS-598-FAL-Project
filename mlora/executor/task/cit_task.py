@@ -9,6 +9,7 @@ from mlora.config import CITTaskConfig
 from mlora.executor.context import TrainLoRAContext
 from mlora.model.args import MLoRADataConfig, Tokens
 
+from .task_base import Task
 from .train_task import TrainTask
 
 

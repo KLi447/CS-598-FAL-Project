@@ -12,7 +12,7 @@ from mlora.executor.context import TrainTaskContext
 from mlora.model.args import LinearInfo, Masks, MLoRADataConfig, Tokens
 from mlora.model.tokenizer import Tokenizer
 
-from .task import Task
+from .task_base import Task
 
 
 def _get_context_state_from_folder_name(dir_name: str) -> Tuple[int, int, int]:
