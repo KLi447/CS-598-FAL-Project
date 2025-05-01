@@ -66,6 +66,7 @@ tasks:
     eval_step: 50  # Evaluate more frequently
     loss_type: "sigmoid"
     beta: 0.1
+    label_smoothing: 0.0
     metrics:
       - "loss"
       - "reward_chosen"
@@ -87,6 +88,7 @@ tasks:
     eval_step: 50
     loss_type: "sigmoid"
     beta: 0.1
+    label_smoothing: 0.0
     metrics:
       - "loss"
       - "reward_chosen"
@@ -108,6 +110,7 @@ tasks:
     eval_step: 50
     loss_type: "sigmoid"
     beta: 0.1
+    label_smoothing: 0.0
     metrics:
       - "loss"
       - "reward_chosen"
