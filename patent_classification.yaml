@@ -4,7 +4,9 @@ dispatcher:
 
 datasets:
   - name: "patent_data"
-    data: "data/patent-classification"
+    data: "ccdv/patent-classification"  # Changed this line to use HF dataset ID
+    data_type: "huggingface"  # Added this line to specify it's a HF dataset
+    subset: "patent"  # Added this line to specify the subset
     prompt: "demo/prompt.yaml"
     prompt_type: "instruction"
     preprocess: "shuffle"
