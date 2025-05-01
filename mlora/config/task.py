@@ -10,6 +10,7 @@ from .cpo import CPOTaskConfig
 from .ppo import PPOTaskConfig
 from .cit import CITTaskConfig
 from .dpo import DPOTaskConfig
+from .base import TaskConfig
 
 
 class TaskConfig(DictConfig):
@@ -222,7 +223,7 @@ class PPOTaskConfig(TrainTaskConfig):
             self.reference_ = adapters[config["reference"]]
 
 
-TASKCONFIG_CLASS: Dict[str, Type["TaskConfig"]] = {
+TASKCONFIG_CLASS: Dict[str, type] = {
     "train": TrainTaskConfig,
     "cpo": CPOTaskConfig,
     "ppo": PPOTaskConfig,

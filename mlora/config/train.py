@@ -3,7 +3,7 @@ from typing import Dict, Mapping
 
 from .adapter import AdapterConfig
 from .dataset import DatasetConfig
-from .task import TaskConfig
+from .base import TaskConfig
 
 class TrainTaskConfig(TaskConfig):
     batch_size_: int

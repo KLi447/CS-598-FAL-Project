@@ -4,7 +4,7 @@ import mlora.executor
 import mlora.config
 import logging
 import argparse
-from mlora.executor.task.patent_task import PatentTask
+from mlora.executor.task.dpo_task import DPOTask
 from mlora.executor.task.task import TASK_CLASS
 
 def setup_logging():
@@ -17,8 +17,8 @@ def main():
     # Setup logging
     setup_logging()
     
-    # Register our custom task type
-    TASK_CLASS["patent"] = PatentTask
+    # Register DPO task type
+    TASK_CLASS["dpo"] = DPOTask
     
     # Parse command line arguments
     parser = argparse.ArgumentParser()
@@ -46,17 +46,18 @@ def main():
     executor = mlora.executor.Executor(model, tokenizer, config)
     
     # Add task
-    logging.info("Adding classification task...")
+    logging.info("Adding DPO task...")
     for item in config.tasks_:
         executor.add_task(item)
     
     # Execute training
-    logging.info("Starting training...")
+    logging.info("Starting DPO training...")
     executor.execute()
     
-    logging.info("Training complete!")
+    logging.info("DPO training complete!")
 
 if __name__ == "__main__":
     main() 
 
-#python train_patent.py --base_model TinyLlama/TinyLlama-1.1B-Chat-v0.4 --config patent_classification.yaml --device cuda:0 --precision fp32
+# Example command:
+# python train_patent.py --base_model TinyLlama/TinyLlama-1.1B-Chat-v0.4 --config dpo_config.yaml --device cuda:0 --precision fp32
