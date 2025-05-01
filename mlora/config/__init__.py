@@ -19,8 +19,8 @@ from .task import (
     PPOTaskConfig,
     TaskConfig,
     TrainTaskConfig,
+    PatentTaskConfig
 )
-from .patent import PatentTaskConfig
 
 __all__ = [
     "MLoRAConfig",
