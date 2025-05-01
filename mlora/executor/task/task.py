@@ -11,11 +11,10 @@ from tqdm import tqdm
 from mlora.config import (
     TaskConfig,
     TrainTaskConfig,
-    InferenceTaskConfig,
-    BenchmarkTaskConfig,
-    PPOTaskConfig,
     CPOTaskConfig,
-    MultitaskConfig
+    PPOTaskConfig,
+    CITTaskConfig,
+    DPOTaskConfig
 )
 from mlora.executor.context import TRAINCONTEXT_CLASS, TaskContext
 from mlora.model.args import LinearInfo, Masks, MLoRADataConfig, Tokens
@@ -25,20 +24,18 @@ from mlora.prompter import Prompter, PrompterFactory
 
 TASKCONFIG_CLASS: Dict[str, type] = {
     "train": TrainTaskConfig,
-    "inference": InferenceTaskConfig,
-    "benchmark": BenchmarkTaskConfig,
-    "ppo": PPOTaskConfig,
     "cpo": CPOTaskConfig,
-    "multitask": MultitaskConfig,
+    "ppo": PPOTaskConfig,
+    "cit": CITTaskConfig,
+    "dpo": DPOTaskConfig,
 }
 
 TASK_CLASS: Dict[str, type] = {
     "train": TrainTask,
-    "inference": InferenceTask,
-    "benchmark": BenchmarkTask,
-    "ppo": PPOTask,
     "cpo": CPOTask,
-    "multitask": MultitaskTask,
+    "ppo": PPOTask,
+    "cit": CITTask,
+    "dpo": DPOTask,
 }
 
 class Task:
