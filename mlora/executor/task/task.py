@@ -14,7 +14,8 @@ from mlora.config import (
     CPOTaskConfig,
     PPOTaskConfig,
     CITTaskConfig,
-    DPOTaskConfig
+    DPOTaskConfig,
+    PatentTaskConfig
 )
 from mlora.executor.context import TRAINCONTEXT_CLASS, TaskContext
 from mlora.model.args import LinearInfo, Masks, MLoRADataConfig, Tokens
@@ -29,6 +30,7 @@ from .cpo_task import CPOTask
 from .ppo_task import PPOTask
 from .cit_task import CITTask
 from .dpo_task import DPOTask
+from .patent_task import PatentTask
 
 TASKCONFIG_CLASS: Dict[str, type] = {
     "train": TrainTaskConfig,
@@ -36,6 +38,7 @@ TASKCONFIG_CLASS: Dict[str, type] = {
     "ppo": PPOTaskConfig,
     "cit": CITTaskConfig,
     "dpo": DPOTaskConfig,
+    "patent": PatentTaskConfig,
 }
 
 TASK_CLASS: Dict[str, type] = {
@@ -44,6 +47,7 @@ TASK_CLASS: Dict[str, type] = {
     "ppo": PPOTask,
     "cit": CITTask,
     "dpo": DPOTask,
+    "patent": PatentTask,
 }
 
 __all__ = ["Task", "TASK_CLASS", "TASKCONFIG_CLASS"]
