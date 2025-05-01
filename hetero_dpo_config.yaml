@@ -8,6 +8,7 @@ datasets:
     prompt: "prompts/dpo_prompt.yaml"
     prompt_type: "preference"
     preprocess: "default"
+    max_samples: 1000
 
 adapters:
   # First LoRA adapter for query and key projections
@@ -54,7 +55,7 @@ tasks:
     dataset: "dpo_data"
     batch_size: 16
     mini_batch_size: 16
-    num_epochs: 10
+    num_epochs: 4
     cutoff_len: 256
     save_step: 2000
     loss_type: "sigmoid"
