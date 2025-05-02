@@ -184,7 +184,7 @@ tasks:
     mini_batch_size: 16
     num_epochs: 2
     cutoff_len: 256
-    save_step: 50
+    save_step: 10000000 # 10 million steps so that it doesn't save every step
     eval_step: 50
     gamma: 0.99
     lamdb: 0.95
@@ -208,7 +208,7 @@ tasks:
     mini_batch_size: 16
     num_epochs: 2
     cutoff_len: 256
-    save_step: 50
+    save_step: 10000000 # 10 million steps so that it doesn't save every step
     eval_step: 50
     gamma: 0.99
     lamdb: 0.95
@@ -232,7 +232,7 @@ tasks:
     mini_batch_size: 16
     num_epochs: 2
     cutoff_len: 256
-    save_step: 50
+    save_step: 10000000 # 10 million steps so that it doesn't save every step
     eval_step: 50
     gamma: 0.99
     lamdb: 0.95
@@ -257,7 +257,7 @@ tasks:
     mini_batch_size: 16
     num_epochs: 2
     cutoff_len: 256
-    save_step: 50
+    save_step: 10000000 # 10 million steps so that it doesn't save every step
     eval_step: 50
     gamma: 0.99
     lamdb: 0.95
