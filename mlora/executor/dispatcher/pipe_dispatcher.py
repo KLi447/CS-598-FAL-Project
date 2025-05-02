@@ -26,18 +26,35 @@ class PipeDispatcher(BackendDispatcher):
         self.list_lock = threading.Lock()
 
     def _compute_placement(self, candidates: List[Task]):
-        gpu_states = query_all_gpus()
+        gpu_state = query_all_gpus()[0]
 
-        def cost_key(task):
+        def score_task(task):
             adapter = task.adapter_name()[0]
             prof    = self.adapter_profiles[adapter]
-            return prof.flops_per_token_fwd * (task.waiting + 1) # ignore memory for now
+            
+            free_memory = gpu_state.free_mem
+            gpu_util = gpu_state.gpu_util
+
+            extra_mem = free_memory - prof.total_memory_estimate(
+                task.config_.batch_size_, 256) ##FIXME
+            if extra_mem < 0:
+                return float('-inf')
+
+            memory_score = extra_mem / free_memory
+            compute_score = prof.flops_per_token_fwd * (1 - gpu_util)
+
+            wait_boost = min(task.waiting / 20, 1.0) #temp max wait, tbd FIXME
+            # probably determined by max epochs
+            aging_score = 1.0 + (wait_boost ** 2)
+
+            #tbd FIXME?
+            return (0.6 * memory_score) + (0.25 * compute_score) * aging_score + (0.15 * wait_boost)
         
         for c in candidates:
             logging.info(f"C: {c.config_.name_}, epoch: {c.now_epoch_}, waiting: {c.waiting}")
 
         # return a copy of the list so that we don't modify candidates list itself
-        return sorted(candidates, key=cost_key, reverse=True)
+        return sorted(candidates, key=score_task, reverse=True)
 
     @override
     def _dispatch_task_in(self):
