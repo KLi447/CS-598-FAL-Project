@@ -8,7 +8,10 @@ if [ $FREE -lt $NEEDED ]; then
     exit 1
 fi
 
-# #./check_space.sh && python mlora_train.py \
+#Make the script executable
+#chmod +x check_space.sh
+
+# python mlora_train.py \
 #   --base_model TinyLlama/TinyLlama-1.1B-Chat-v0.4 \
 #   --config ppo_critic_actor.yaml \
 #   --device cuda \
