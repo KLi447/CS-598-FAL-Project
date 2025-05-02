@@ -500,7 +500,6 @@ class PipeExecutor(Executor):
         
         with self.slot_lock:
             for i, in_use in enumerate(self.stream_taken):
-                logging.info(f"i: {i}, in use: {in_use}")
                 if not in_use:
                     self.stream_taken[i]      = True
                     self.task_slot[task.task_name()] = i
@@ -518,10 +517,6 @@ class PipeExecutor(Executor):
         if task.task_name() in self.task_slot:
             slot = self.task_slot[task.task_name()]
             recv_stream, comp_stream, send_stream = self.stream_pools[slot]
-
-            recv_stream.stream_.synchronize()
-            comp_stream.stream_.synchronize()
-            send_stream.stream_.synchronize()
 
             self.stream_taken[slot] = False
 

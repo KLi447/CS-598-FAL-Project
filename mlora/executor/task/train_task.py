@@ -27,6 +27,7 @@ def _get_context_state_from_folder_name(dir_name: str) -> Tuple[int, int, int]:
 
 class TrainTask(Task):
     now_epoch_: int
+    waiting: int
 
     context_: TrainTaskContext
     config_: TrainTaskConfig
@@ -34,6 +35,7 @@ class TrainTask(Task):
     def __init__(self, config: TaskConfig, llm_name: str) -> None:
         super().__init__(config, llm_name)
         self.now_epoch_ = 1
+        self.waiting = 0
 
     @override
     def is_done(self) -> bool:

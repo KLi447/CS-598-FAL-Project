@@ -31,10 +31,10 @@ class PipeDispatcher(BackendDispatcher):
         def cost_key(task):
             adapter = task.adapter_name()[0]
             prof    = self.adapter_profiles[adapter]
-            return prof.flops_per_token_fwd # ignore memory for now
+            return prof.flops_per_token_fwd * (task.waiting + 1) # ignore memory for now
         
         for c in candidates:
-            logging.info(f"C: {c.config_.name_}, epoch: {c.now_epoch_}")
+            logging.info(f"C: {c.config_.name_}, epoch: {c.now_epoch_}, waiting: {c.waiting}")
 
         # return a copy of the list so that we don't modify candidates list itself
         return sorted(candidates, key=cost_key, reverse=True)
@@ -147,11 +147,16 @@ class PipeDispatcher(BackendDispatcher):
 
             num_to_run = min(len(can_run_tasks), self.concurrency_num_ - len(self.running_))
             if num_to_run <= 0:
-                logging.debug(f"Running queue full ({len(self.running_)}/{self.concurrency_num_}) or no candidates.")
                 return None
 
             task = self._compute_placement(can_run_tasks)[0]
             logging.info(f"Selected task: {task.task_name()}")
+
+            for t in self.ready_:
+                if t != task:
+                    t.waiting += 1
+                else:
+                    t.waiting = 0
 
             try:
                 self.ready_.remove(task)
@@ -160,7 +165,6 @@ class PipeDispatcher(BackendDispatcher):
                 self.lock_task(task.task_name())
                 logging.info(f"Task {task.task_name()} moved to running.")
             except ValueError:
-                    logging.error(f"Task {task.task_name()} selected but not found in ready_ list. Concurrency issue?")
                     # Handle error: maybe skip task, maybe raise exception
                     return None
 
