@@ -295,6 +295,7 @@ We fine-tuned multiple LoRA adapters using four A6000 graphics cards with fp32 p
 - Help Document[TODO]
 - [Design Document](./docs/design.md)
 - [How to develop a new adapter](./docs/develop_new_adapter.md)
+- [How to reproduce the paper](./benchmarks/README.md)
 
 ## Contributing
 We welcome contributions to improve this repository! Please review the contribution guidelines before submitting pull requests or issues.
