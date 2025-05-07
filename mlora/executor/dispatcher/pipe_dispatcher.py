@@ -31,27 +31,34 @@ class PipeDispatcher(BackendDispatcher):
         def score_task(task):
             adapter = task.adapter_name()[0]
             prof    = self.adapter_profiles[adapter]
-            
+
             free_memory = gpu_state.free_mem
             gpu_util = gpu_state.gpu_util
 
             extra_mem = free_memory - prof.total_memory_estimate(
-                task.config_.batch_size_, 256) ##FIXME
+                task.config_.batch_size_, 256)
             if extra_mem < 0:
                 return float('-inf')
 
-            memory_score = extra_mem / free_memory
-            compute_score = prof.flops_per_token_fwd * (1 - gpu_util)
+            memory_score = (free_memory - extra_mem) / free_memory 
 
-            wait_boost = min(task.waiting / 20, 1.0) #temp max wait, tbd FIXME
-            # probably determined by max epochs
+            gpu_util_decimal = gpu_util / 100.0
+            gpu_availability_fraction = 1.0 - gpu_util_decimal
+            gpu_availability_fraction = max(0.0, min(1.0, gpu_availability_fraction))
+
+            task_normalized_flops = prof.flops_per_token_fwd / max([p.flops_per_token_fwd for s, p in self.adapter_profiles.items()])
+
+            compute_score = task_normalized_flops * gpu_availability_fraction
+
+            wait_boost = min(task.waiting / 20, 1.0)
             aging_score = 1.0 + (wait_boost ** 2)
 
-            #tbd FIXME?
-            return (0.6 * memory_score) + (0.25 * compute_score) * aging_score + (0.15 * wait_boost)
+            logging.info(f"name: {task.task_name()} mem: {memory_score} comp: {compute_score} wait: {aging_score}")
+
+            return (0.3 * memory_score) + (0.7 * compute_score) * aging_score + (0.1 * wait_boost)
         
         for c in candidates:
-            logging.info(f"C: {c.config_.name_}, epoch: {c.now_epoch_}, waiting: {c.waiting}")
+            logging.info(f"C: {c.config_.name_}, epoch: {c.now_epoch_}, waiting: {c.waiting}, score: {score_task(c)}")
 
         # return a copy of the list so that we don't modify candidates list itself
         return sorted(candidates, key=score_task, reverse=True)
