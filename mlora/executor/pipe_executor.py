@@ -222,7 +222,7 @@ class PipeExecutor(Executor):
                         total_fwd_flops += mods
                         total_bwd_flops += 2 * mods
 
-            param_bytes = total_params * 4  # fp32
+            param_bytes = total_params * 2 // (1024 * 1024)  # fp16
             self.adapter_profiles[name] = AdapterProfile(
                 param_bytes           = param_bytes,
                 flops_per_token_fwd   = total_fwd_flops,
@@ -397,6 +397,7 @@ class PipeExecutor(Executor):
 
                 if total_loss is not None:
                     total_loss.backward()
+        # comp_stream.stream_.synchronize() ##HERE, needs fix
 
     def __process_input(self):
         train_data: MLoRAData | None = self.dispatcher_.data()
@@ -519,6 +520,8 @@ class PipeExecutor(Executor):
             recv_stream, comp_stream, send_stream = self.stream_pools[slot]
 
             self.stream_taken[slot] = False
+
+        task.switch_device("cpu")
 
     def __task_to_done_hook(self, task: Task):
         logging.info(f"Finish and base model offload adapter - {task.adapter_name()}")
