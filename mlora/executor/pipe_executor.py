@@ -16,6 +16,7 @@ from mlora.model.llm import LLMModel
 from mlora.model.llm.model_llama import precompute_mask
 from mlora.model.tokenizer import Tokenizer
 from mlora.utils.gpu_state import AdapterProfile
+from mlora.utils.shutdown import is_shutdown_requested
 
 from .dispatcher import DISPATCHER_CLASS, PipeDispatcher
 from .executor import Executor
@@ -241,20 +242,35 @@ class PipeExecutor(Executor):
             )
 
     def __head_worker_run(self):
-        while True:
+        logging.info(f"PipeExecutor (Rank {self.rank_}) Head worker run starting")
+        while not is_shutdown_requested():
             # we get the model's output, and calc the loss
             self.__process_comm()
             self.__process_backward()
             self.__process_output()
             self.__process_input()
+            
+            if is_shutdown_requested():
+                logging.info(f"PipeExecutor (Rank {self.rank_}) Head worker detected shutdown. Exiting loop.")
+                break
             time.sleep(1 / 100000)
+            
+        logging.info(f"PipeExecutor (Rank {self.rank_}) Head worker loop finished.")
 
     def __not_head_worker_run(self):
-        while True:
+        logging.info(f"PipeExecutor (Rank {self.rank_}) Non-head worker run starting")
+        while not is_shutdown_requested():
             self.__process_comm()
             self.__process_backward()
             self.__process_forward()
+            
+            if is_shutdown_requested():
+                logging.info(f"PipeExecutor (Rank {self.rank_}) Non-Head worker detected shutdown. Exiting loop.")
+                break
+            
             time.sleep(1 / 100000)
+            
+        logging.info(f"PipeExecutor (Rank {self.rank_}) Non-Head worker loop finished.")
 
     def __head_process_step(self, message: PipeMessage):
         assert message.model_data_ is not None
@@ -499,12 +515,17 @@ class PipeExecutor(Executor):
         return data[0]
 
     def execute(self) -> None:
-        if self.role_ == WorkerRole.HEAD:
-            self.__head_worker_run()
-        elif self.role_ == WorkerRole.MID or self.role_ == WorkerRole.TAIL:
-            self.__not_head_worker_run()
-        else:
-            raise NotImplementedError
+        try:
+            if self.role_ == WorkerRole.HEAD:
+                self.__head_worker_run()
+            elif self.role_ == WorkerRole.MID or self.role_ == WorkerRole.TAIL:
+                self.__not_head_worker_run()
+            else:
+                raise NotImplementedError
+        finally:
+            logging.info(f"PipeExecutor (Rank: {self.rank_}) stopping RPC transport. In execute()")
+            self.transport_.stop()
+            logging.info(f"PipeExecutor (Rank: {self.rank_}) stopped RPC transport. In execute()")
 
     def add_task(self, config: TaskConfig):
         if self.role_ != WorkerRole.TAIL:

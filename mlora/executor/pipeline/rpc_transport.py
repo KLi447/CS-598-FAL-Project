@@ -12,6 +12,7 @@ import torch.distributed.rpc
 from .messages import PipeMessage, PipeMessageType
 from .queue import DeviceSwapQueue
 from .transport import Transport
+from mlora.utils import is_shutdown_requested
 
 # save by different message type
 # recv/send queue will automatically change the tensors' device
@@ -133,7 +134,11 @@ class RpcTransport(Transport):
         assert send_queue is not None
 
         while not self.stop_ or not send_queue.empty():
-            msg = send_queue.get_waitime()
+            # if is_shutdown_requested():
+            #     logging.info(f"RpcTransport (Rank {self.rank_}) __send_loop thread detected shutdown. Exiting loop.")
+            #     break
+            
+            msg = send_queue.get_waitime()  # waits default 10 seconds
             if msg is None:
                 continue
             assert msg.tensor_data_ is not None
@@ -145,6 +150,11 @@ class RpcTransport(Transport):
             torch.distributed.rpc.rpc_async(
                 msg.dst_, rpc_push_device_swap_queue, args=(msg,)
             )
+            
+            # if self.stop_:
+            #     break   # break the loop if stop_ is set so that .join() runs properly
+        
+        logging.info(f"RpcTransport (Rank {self.rank_}) send loop finished.")
 
     def __comm_send_loop(self, msg_type: PipeMessageType):
         global RPCCOMMMessageSendQueues
@@ -152,8 +162,13 @@ class RpcTransport(Transport):
         assert send_queue is not None
 
         while not self.stop_ or not send_queue.empty():
+            # if is_shutdown_requested():
+            #     logging.info(f"RpcTransport (Rank {self.rank_}) __comm_send_loop thread detected shutdown. Exiting loop.")
+            #     break
+            
             try:
-                msg = send_queue.get(block=True, timeout=10)
+                # NOTE: changed timeout from 10 to 5
+                msg = send_queue.get(block=True, timeout=5)
             except Exception:
                 continue
 
@@ -162,23 +177,37 @@ class RpcTransport(Transport):
                 f" to {msg.dst_}."
             )
             torch.distributed.rpc.rpc_async(msg.dst_, rpc_push_comm_queue, args=(msg,))
+            
+            # if self.stop_:
+            #     break   # break the loop if stop_ is set so that .join() runs properly
+        
+        logging.info(f"RpcTransport (Rank {self.rank_}) comm send loop finished.")
 
     def __stop_send_loop(self):
         global RPCMessageRecvQueues
         global RPCMessageSendQueues
 
+        logging.info(f"RpcTransport (Rank {self.rank_}) __stop_send_loop called.")
+        
         # first should stop the recv queue
         for key in RPCMessageRecvQueues:
+            logging.info(f"__stop_send_loop(): calling stop on key:{key} in RecvQueue")
             RPCMessageRecvQueues[key].stop()
+            logging.info(f"__stop_send_loop(): finished stop on key:{key} in RecvQueue")
+            
 
         # then stop the send queue
         for key in RPCMessageSendQueues:
+            logging.info(f"__stop_send_loop(): calling stop on key:{key} in SendQueue")
             RPCMessageSendQueues[key].stop()
+            logging.info(f"__stop_send_loop(): finished stop on key:{key} in SendQueue") 
 
         self.stop_ = True
+        logging.info(f"RpcTransport (Rank {self.rank_}) __stop_send_loop: Going to call .join() on all send threads.")
         self.activations_send_thread_.join()
         self.gradients_send_thread_.join()
         self.comm_send_thread_.join()
+        logging.info(f"RpcTransport (Rank {self.rank_}) __stop_send_loop finished.")
 
     def __stop_rpc(self):
         torch.distributed.rpc.shutdown()
@@ -189,15 +218,22 @@ class RpcTransport(Transport):
 
     @override
     def recv_message(
-        self, msg_type: PipeMessageType, block: bool = False
+        self, msg_type: PipeMessageType, block: bool = False, timeout: int = 5
     ) -> PipeMessage | None:
         global RPCMessageRecvQueues
 
+        if is_shutdown_requested():
+            logging.info(f"rpc_transport recv_message detected shutdown. Exiting loop.")
+            return None
+        
         assert msg_type in RPCMessageRecvQueues
         recv_queue: DeviceSwapQueue = RPCMessageRecvQueues[msg_type]
 
         if block:
-            msg = recv_queue.get()
+            logging.info("rpc_transport recv_message blocking get() is called...")
+            msg = recv_queue.get()    # NOTE: not changing this for now since block=False most times i think?
+            logging.info("rpc_transport recv_message blocking get() is finished")
+            # msg = recv_queue.get_waitime(timeout)
         else:
             msg = recv_queue.get_nowait()
 
