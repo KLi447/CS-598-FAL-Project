@@ -20,9 +20,24 @@ import mlora.model
 import mlora.utils
 import mlora.executor
 import mlora.config
+from mlora.utils.shutdown import request_shutdown
+import signal
+import logging
+import sys
+
+count = 0
+def sigint_handler(sig, frame):
+    global count
+    count += 1
+    logging.info("Caught Signal in handler")
+    if count == 2:
+        exit(0)
+    request_shutdown(signal.Signals(sig).name)
 
 if __name__ == "__main__":
     args = mlora.utils.get_cmd_args()
+    signal.signal(signal.SIGINT, sigint_handler)
+    signal.signal(signal.SIGTERM, sigint_handler)
 
     mlora.utils.setup_seed(args.seed)
     mlora.utils.setup_logging(args.log_level, args.log_file)
@@ -46,4 +61,16 @@ if __name__ == "__main__":
         for item in config.tasks_:
             executor.add_task(item)
 
-    executor.execute()
+    try:
+        executor.execute()
+    except KeyboardInterrupt:
+        logging.error(f"KeyboardInterrupt exception in main", exc_info=True)
+        request_shutdown("ExceptionInMain") # Ensure shutdown on other errors too
+    finally:
+        logging.info("Main: Performing final cleanup...")
+        if hasattr(executor, 'transport_') and executor.transport_ is not None and not executor.transport_.stop_:
+            logging.info(f"Main: Attempting to stop transport for executor (Rank {executor.rank_}).")
+            executor.transport_.stop()
+            logging.info(f"Main: Transport for executor (Rank {executor.rank_}) stopped.")
+            
+    logging.info("mLoRA training process finished. End of main()")

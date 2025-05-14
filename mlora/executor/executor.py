@@ -8,6 +8,7 @@ from mlora.config import MLoRAConfig, TaskConfig
 from mlora.model.args import MLoRAData
 from mlora.model.llm import LLMModel
 from mlora.model.tokenizer import Tokenizer
+from mlora.utils.shutdown import is_shutdown_requested
 
 from .dispatcher import DISPATCHER_CLASS, Dispatcher
 from .task import Task
@@ -99,6 +100,9 @@ class Executor:
         mm_collect_step = 0
 
         while not self.dispatcher_.is_done():
+            if is_shutdown_requested():
+                logging.info(f"Executor execute() detected shutdown. Exiting loop.")
+                break
             data: MLoRAData | None = self.dispatcher_.data()
             assert data is not None
 
