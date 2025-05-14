@@ -373,7 +373,8 @@ class PipeExecutor(Executor):
         with torch.cuda.stream(comp_stream.stream_):
             data = self.__forward(data, message.model_data_)
             # todo: here
-
+        
+        # comp_stream.stream_.synchronize()   # UNCOMMENT FOR NANs
         comp_stream.poll()
         assert message.model_data_ is not None
         return self.__send_activations(data, message.model_data_)
@@ -442,8 +443,8 @@ class PipeExecutor(Executor):
                 total_loss = loss if total_loss is None else total_loss + loss
 
                 if total_loss is not None:
-                    total_loss.backward()   # TODO: here uncomment
-        # comp_stream.stream_.synchronize() ##HERE, needs fix
+                    total_loss.backward()   # TODO: here
+        # comp_stream.stream_.synchronize() ##HERE, needs fix - UNCOMMENT IF NANs
 
     def __process_input(self):
         train_data: MLoRAData | None = self.dispatcher_.data()
@@ -470,6 +471,7 @@ class PipeExecutor(Executor):
             hidden_data = self.__forward(tensor_data, train_data.model_data())
             # TODO: here
 
+        # comp_stream.stream_.synchronize() # UNCOMMENT IF NANs
         # step2. then send the hidden state to next worker
         comp_stream.poll()
         self.__send_activations(hidden_data, train_data.model_data())
