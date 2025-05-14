@@ -39,6 +39,7 @@ class Dispatcher:
     def __init__(self, config: DispatcherConfig) -> None:
         self.name_ = config.name_
         self.concurrency_num_ = config.concurrency_num_
+        self.config_ = config
 
         self.ready_ = []
         self.running_ = []

@@ -29,7 +29,7 @@ if __name__ == "__main__":
         print("Using standard LoRA mode.")
 
     executor = mlora.executor.PipeExecutor(
-        model, tokenizer, config, args.device, args.rank, args.balance, args.recompute
+        model, tokenizer, config, args.device, args.rank, args.nodes, args.recompute
     )
 
     if args.rank == 0:
