@@ -12,7 +12,7 @@ import torch.distributed.rpc
 from .messages import PipeMessage, PipeMessageType
 from .queue import DeviceSwapQueue
 from .transport import Transport
-from mlora.utils import is_shutdown_requested
+from mlora.utils.shutdown import is_shutdown_requested
 
 # save by different message type
 # recv/send queue will automatically change the tensors' device
@@ -138,7 +138,7 @@ class RpcTransport(Transport):
             #     logging.info(f"RpcTransport (Rank {self.rank_}) __send_loop thread detected shutdown. Exiting loop.")
             #     break
             
-            msg = send_queue.get_waitime()  # waits default 10 seconds
+            msg = send_queue.get_waitime(timeout=1)  # waits default 10 seconds
             if msg is None:
                 continue
             assert msg.tensor_data_ is not None

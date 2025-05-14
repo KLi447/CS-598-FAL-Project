@@ -11,7 +11,7 @@ import torch.distributed.rpc
 
 from .messages import PipeMessage, PipeMessageType
 from .transport import Transport
-from mlora.utils import is_shutdown_requested
+from mlora.utils.shutdown import is_shutdown_requested
 
 # save by different message type
 # recv/send queue will automatically change the tensors' device

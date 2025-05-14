@@ -4,7 +4,7 @@ from typing import override
 
 from mlora.config.dispatcher import DispatcherConfig
 from mlora.config.task import TaskConfig
-from mlora.utils import is_shutdown_requested
+from mlora.utils.shutdown import is_shutdown_requested
 
 from .dispatcher import Dispatcher
 
@@ -35,5 +35,6 @@ class BackendDispatcher(Dispatcher):
                 # logging.info("Dispatcher is_done(): sem.acquire() timed out. Returning True indicating we're done!")
                 # return True    # failed to get a task due to the timeout, so return true indicating we're basically done
                 # TODO: can potentially change this to just 'continue' so that it checks if it shutdown is requested. that way it only exits when a shutdown is requested
+                logging.info("Dispatcher is_done(): sem.acquire() timed out. Continuing...")
                 continue
         return False

@@ -8,7 +8,7 @@ from mlora.config import MLoRAConfig, TaskConfig
 from mlora.model.args import MLoRAData
 from mlora.model.llm import LLMModel
 from mlora.model.tokenizer import Tokenizer
-from mlora.utils import is_shutdown_requested
+from mlora.utils.shutdown import is_shutdown_requested
 
 from .dispatcher import DISPATCHER_CLASS, Dispatcher
 from .task import Task

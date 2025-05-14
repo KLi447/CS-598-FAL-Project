@@ -372,6 +372,7 @@ class PipeExecutor(Executor):
         
         with torch.cuda.stream(comp_stream.stream_):
             data = self.__forward(data, message.model_data_)
+            # todo: here
 
         comp_stream.poll()
         assert message.model_data_ is not None
@@ -441,7 +442,7 @@ class PipeExecutor(Executor):
                 total_loss = loss if total_loss is None else total_loss + loss
 
                 if total_loss is not None:
-                    total_loss.backward()
+                    total_loss.backward()   # TODO: here uncomment
         # comp_stream.stream_.synchronize() ##HERE, needs fix
 
     def __process_input(self):
@@ -467,6 +468,7 @@ class PipeExecutor(Executor):
             train_data.computation_time_ = time.time()
             # -- dev/kev ---
             hidden_data = self.__forward(tensor_data, train_data.model_data())
+            # TODO: here
 
         # step2. then send the hidden state to next worker
         comp_stream.poll()
