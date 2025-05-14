@@ -32,6 +32,9 @@ class MLoRAConfig:
                 TASKCONFIG_CLASS[item["type"]](item, self.__adapters_, self.__datasets_)
             )
 
+    def adapters(self) -> Dict[str, AdapterConfig]:
+        return self.__adapters_
+
     def __init__(self, path: str):
         with open(path) as fp:
             config = yaml.safe_load(fp)

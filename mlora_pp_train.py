@@ -38,7 +38,7 @@ if __name__ == "__main__":
 
     # init all task from config file
     executor = mlora.executor.PipeExecutor(
-        model, tokenizer, config, args.device, args.rank, args.balance, args.recompute
+        model, tokenizer, config, args.device, args.rank, args.nodes, args.recompute
     )
 
     # only the header node can add task
