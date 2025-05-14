@@ -5,6 +5,7 @@ from .adapter import (
     LoRAConfig,
     LoRAPlusConfig,
     VeRAConfig,
+    FloraPerExampleConfig
 )
 from .dataset import DatasetConfig
 from .lr_scheduler import LRSchedulerConfig
@@ -39,4 +40,5 @@ __all__ = [
     "OptimizerConfig",
     "LRSchedulerConfig",
     "PPOTaskConfig",
+    "FloraPerExampleConfig",
 ]

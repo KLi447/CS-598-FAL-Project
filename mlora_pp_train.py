@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # m-LoRA: Efficient Multi-LoRA Fine Tuning with Shared-Based Model
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,25 +24,29 @@ import mlora.config
 
 if __name__ == "__main__":
     args = mlora.utils.get_cmd_args()
-
     mlora.utils.setup_seed(args.seed)
     mlora.utils.setup_logging(args.log_level, args.log_file)
     mlora.utils.setup_cuda_check()
     mlora.utils.setup_metric_logger(args.metric_file)
-
-    # enable the trace mode for profiling performance
     if args.trace:
         mlora.utils.setup_trace_mode()
 
     tokenizer, model = mlora.model.load_model(args)
     config = mlora.config.MLoRAConfig(args.config)
 
-    # init all task from config file
+    if args.fast_lora:
+        print("Using fast (per-example) LoRA mode as specified.")
+        for adapter_name, adapter_conf in config.adapters.items():
+            if adapter_conf.type_ == "lora":
+                # If desired, override normal LoRA adapters to fast mode.
+                adapter_conf.type_ = "flora_per_example"
+    else:
+        print("Using standard LoRA mode.")
+
     executor = mlora.executor.PipeExecutor(
         model, tokenizer, config, args.device, args.rank, args.nodes, args.recompute
     )
 
-    # only the header node can add task
     if args.rank == 0:
         for item in config.tasks_:
             executor.add_task(item)

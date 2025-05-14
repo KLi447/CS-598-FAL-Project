@@ -50,6 +50,8 @@ def _add_base_cmd(parser):
         default="/tmp/mlora_metric",
         help="Save metric to specific file.",
     )
+    parser.add_argument("--fast_lora", action="store_true", 
+                        help="If set, use fast (per-example) LoRA fine tuning. Otherwise use normal LoRA.")
     return parser
 
 
