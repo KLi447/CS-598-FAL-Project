@@ -1,3 +1,4 @@
+Install dependencies from pyproject.toml
 ## To run distributed heterogenous training
 export MASTER_ADDR= "address of host GPU"
 export MASTER_PORT=12345
