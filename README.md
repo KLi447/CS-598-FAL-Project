@@ -315,6 +315,16 @@ Or just call the script to check your code
 .github/workflows/pre-commit
 ```
 
+Make the Directory for the Anthropic RLHF Huggingface Dataset
+```bash
+   mkdir -p data/hh-rlhf
+```
+
+Download the Dataset to use for PPO Training
+```bash
+python download_dataset.py
+```
+
 ## Citation
 Please cite the repo if you use the code in this repo.
 ```bibtex
