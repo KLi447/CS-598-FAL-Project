@@ -15,6 +15,7 @@ from mlora.model.llm import LLMModel
 from mlora.model.llm.model_llama import precompute_mask
 from mlora.model.tokenizer import Tokenizer
 from mlora.utils.gpu_state import AdapterProfile
+from mlora.utils.shutdown import is_shutdown_requested
 
 from .dispatcher import DISPATCHER_CLASS, PipeDispatcher
 from .executor import Executor
@@ -22,6 +23,7 @@ from .pipeline.function import RecvOperator, SendOperator
 from .pipeline.messages import PipeMessage, PipeMessageType
 from .pipeline.queue import DeviceSwapQueue
 from .pipeline.rpc_transport import RpcTransport
+from .pipeline.rpc_transport_block import RpcTransportBlock
 from .pipeline.stream import CudaStream
 from .task import Task
 
@@ -53,6 +55,8 @@ class PipeExecutor(Executor):
     backward_cache_: Dict[int, torch.Tensor]
     input_cache_: Dict[int, MLoRAData]
 
+    cache_forward_: torch.Tensor
+
     # also this
     adapter_profiles: Dict[str, AdapterProfile]
     dispatcher_: PipeDispatcher
@@ -70,6 +74,7 @@ class PipeExecutor(Executor):
         rank: int,
         balance: List[int],
         recompute: bool = False,
+        is_block: bool = False,
     ) -> None:
         self.model_ = model
         self.tokenizer_ = tokenizer
@@ -85,6 +90,8 @@ class PipeExecutor(Executor):
 
         self.backward_cache_ = {}
         self.input_cache_ = {}
+
+        self.cache_forward_ = None
 
         self.recompute_ = recompute
 
@@ -109,9 +116,14 @@ class PipeExecutor(Executor):
         self.task_slot = {}
 
         # init the rpc and wait the cluster node ready
-        self.transport_ = RpcTransport(
-            self.rank_, self.world_size_, torch.device(self.device_)
-        )
+        if is_block:
+            self.transport_ = RpcTransportBlock(
+                self.rank_, self.world_size_, torch.device(self.device_)
+            )
+        else:
+            self.transport_ = RpcTransport(
+                self.rank_, self.world_size_, torch.device(self.device_)
+            )
 
         # config.dispatcher_.concurrency_num_ = n # eventually I should get rid of the logic to process this entirely
 
@@ -222,20 +234,35 @@ class PipeExecutor(Executor):
             )
 
     def __head_worker_run(self):
-        while True:
+        logging.info(f"PipeExecutor (Rank {self.rank_}) Head worker run starting")
+        while not is_shutdown_requested():
             # we get the model's output, and calc the loss
             self.__process_comm()
             self.__process_backward()
             self.__process_output()
             self.__process_input()
+            
+            if is_shutdown_requested():
+                logging.info(f"PipeExecutor (Rank {self.rank_}) Head worker detected shutdown. Exiting loop.")
+                break
             time.sleep(1 / 100000)
+            
+        logging.info(f"PipeExecutor (Rank {self.rank_}) Head worker loop finished.")
 
     def __not_head_worker_run(self):
-        while True:
+        logging.info(f"PipeExecutor (Rank {self.rank_}) Non-head worker run starting")
+        while not is_shutdown_requested():
             self.__process_comm()
             self.__process_backward()
             self.__process_forward()
+            
+            if is_shutdown_requested():
+                logging.info(f"PipeExecutor (Rank {self.rank_}) Non-Head worker detected shutdown. Exiting loop.")
+                break
+            
             time.sleep(1 / 100000)
+            
+        logging.info(f"PipeExecutor (Rank {self.rank_}) Non-Head worker loop finished.")
 
     def __head_process_step(self, message: PipeMessage):
         assert message.model_data_ is not None
@@ -258,7 +285,7 @@ class PipeExecutor(Executor):
         if message is None:
             return
 
-        logging.debug(
+        logging.info(
             f"Recv the gradients - {str(message.msg_id_)[:8]} from {message.src_}."
         )
 
@@ -272,6 +299,7 @@ class PipeExecutor(Executor):
         phony: torch.Tensor = self.backward_cache_.pop(key)
         phony.grad_fn.grad_from_next_worker = message.tensor_data_  # type: ignore
 
+        # ----- dev/kev -------
         slot = self.task_slot[tn]
         _, comp_stream, _ = self.stream_pools[slot]
 
@@ -280,9 +308,22 @@ class PipeExecutor(Executor):
 
         with torch.cuda.stream(comp_stream.stream_):
             phony.backward()
+            # TODO: profiler had a del self.backward_cache_[msg_id] right after phony.backward() and before the 
+            # * if self.cache_forward_ is not None if statement
         comp_stream.stream_.synchronize() ##HERE, needs fix
+        # ----- dev/kev -------
+        
+        # TODO: the profiler added this self.cache_forward if-statement below - double check that 
+        # this is fine with the added code above
+        if self.cache_forward_ is not None:
+            self.cache_forward_.grad_fn.model_data_.communication_time_ = (
+                message.model_data_.communication_time_
+            )
 
         if self.role_ == WorkerRole.HEAD:
+            logging.info(
+                f"total time: {time.time() - message.model_data_.computation_time_} communication time: {message.model_data_.communication_time_}"
+            )
             self.__head_process_step(message)
         else:
             assert message.model_data_ is not None
@@ -297,7 +338,7 @@ class PipeExecutor(Executor):
         if message is None:
             return
 
-        logging.debug(
+        logging.info(
             f"Recv the activations - {str(message.msg_id_)[:8]} from {message.src_}."
         )
 
@@ -316,10 +357,16 @@ class PipeExecutor(Executor):
         # and then send it, so we hook the pre stage fn to poll the stream
         # data.grad_fn.pre_stage_fn = comp_stream.poll  # type: ignore
         assert message.model_data_ is not None
+
+        # profiling
+        self.cache_forward_ = data
+
         
         with torch.cuda.stream(comp_stream.stream_):
             data = self.__forward(data, message.model_data_)
-
+            # todo: here
+        
+        # comp_stream.stream_.synchronize()   # UNCOMMENT FOR NANs
         comp_stream.poll()
         assert message.model_data_ is not None
         return self.__send_activations(data, message.model_data_)
@@ -388,8 +435,8 @@ class PipeExecutor(Executor):
                 total_loss = loss if total_loss is None else total_loss + loss
 
                 if total_loss is not None:
-                    total_loss.backward()
-        # comp_stream.stream_.synchronize() ##HERE, needs fix
+                    total_loss.backward()   # TODO: here
+        # comp_stream.stream_.synchronize() ##HERE, needs fix - UNCOMMENT IF NANs
 
     def __process_input(self):
         train_data: MLoRAData | None = self.dispatcher_.data()
@@ -403,13 +450,20 @@ class PipeExecutor(Executor):
             requires_grad=False,
         )
 
+
+        # ----- dev/kev -------
         tn = train_data.data_config_[0].task_name_
         slot = self.task_slot[tn]
         _, comp_stream, _ = self.stream_pools[slot]
 
         with torch.cuda.stream(comp_stream.stream_):
+            # ----- profiling -------  
+            train_data.computation_time_ = time.time()
+            # -- dev/kev ---
             hidden_data = self.__forward(tensor_data, train_data.model_data())
+            # TODO: here
 
+        # comp_stream.stream_.synchronize() # UNCOMMENT IF NANs
         # step2. then send the hidden state to next worker
         comp_stream.poll()
         self.__send_activations(hidden_data, train_data.model_data())
@@ -457,12 +511,17 @@ class PipeExecutor(Executor):
         return data[0]
 
     def execute(self) -> None:
-        if self.role_ == WorkerRole.HEAD:
-            self.__head_worker_run()
-        elif self.role_ == WorkerRole.MID or self.role_ == WorkerRole.TAIL:
-            self.__not_head_worker_run()
-        else:
-            raise NotImplementedError
+        try:
+            if self.role_ == WorkerRole.HEAD:
+                self.__head_worker_run()
+            elif self.role_ == WorkerRole.MID or self.role_ == WorkerRole.TAIL:
+                self.__not_head_worker_run()
+            else:
+                raise NotImplementedError
+        finally:
+            logging.info(f"PipeExecutor (Rank: {self.rank_}) stopping RPC transport. In execute()")
+            self.transport_.stop()
+            logging.info(f"PipeExecutor (Rank: {self.rank_}) stopped RPC transport. In execute()")
 
     def add_task(self, config: TaskConfig):
         if self.role_ != WorkerRole.TAIL:

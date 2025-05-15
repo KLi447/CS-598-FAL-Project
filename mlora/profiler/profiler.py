@@ -22,8 +22,8 @@ def is_trace_model() -> bool:
 
 
 def __get_scope_name(grad_fn: torch.autograd.graph.Node):
-    if TRACEPOINT_KEY in grad_fn.metadata():
-        return grad_fn.metadata()[TRACEPOINT_KEY]
+    if TRACEPOINT_KEY in grad_fn.metadata:
+        return grad_fn.metadata[TRACEPOINT_KEY]
     return grad_fn.name()
 
 
@@ -136,11 +136,11 @@ def set_backward_tracepoint(
         grad_fn, torch.autograd.graph.Node
     ), f"error type: {type(grad_fn)}"
 
-    if TRACEPOINT_KEY in grad_fn.metadata():
+    if TRACEPOINT_KEY in grad_fn.metadata:
         return
 
     if not recursion:
-        grad_fn.metadata()[TRACEPOINT_KEY] = tp_name
+        grad_fn.metadata[TRACEPOINT_KEY] = tp_name
         return
 
     visited: Set[torch.autograd.graph.Node] = set()
@@ -150,7 +150,7 @@ def set_backward_tracepoint(
 
     while len(to_visited_stack) > 0:
         to_visit = to_visited_stack.pop()
-        to_visit.metadata()[TRACEPOINT_KEY] = tp_name
+        to_visit.metadata[TRACEPOINT_KEY] = tp_name
 
         visited.add(to_visit)
 
@@ -162,7 +162,7 @@ def set_backward_tracepoint(
                 continue
             if next_fn[0] in visited:
                 continue
-            if TRACEPOINT_KEY in next_fn[0].metadata():
+            if TRACEPOINT_KEY in next_fn[0].metadata:
                 continue
             to_visited_stack.append(next_fn[0])
 

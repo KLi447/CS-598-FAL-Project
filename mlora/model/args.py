@@ -92,6 +92,11 @@ class ModelData:
     random_id_: int
     task_name_: List[str]
 
+    communication_time_: float
+    computation_time_: float
+
+    start_point_time_: float
+
 
 class MLoRADataConfig:
     adapter_name_: str
@@ -147,6 +152,11 @@ class MLoRAData:
     # the flag for serialize
     random_id_: int
 
+    communication_time_: float
+    computation_time_: float
+
+    start_point_time_: float
+
     def __init__(
         self,
         batch_tokens: List[Tokens],
@@ -158,6 +168,11 @@ class MLoRAData:
         self.data_config_ = data_config
         self.random_id_ = uuid.uuid4().int
 
+        self.start_point_time_ = 0.0
+
+        self.computation_time_ = 0.0
+        self.communication_time_ = 0.0
+
     def model_data(self) -> ModelData:
         return ModelData(
             batch_tokens_=self.batch_tokens_,
@@ -166,6 +181,9 @@ class MLoRAData:
             enable_checkpoint_=True,
             task_name_=[config.task_name_ for config in self.data_config_],
             random_id_=self.random_id_,
+            communication_time_=self.communication_time_,
+            computation_time_=self.computation_time_,
+            start_point_time_=self.start_point_time_,
         )
 
     def batch_size(self) -> int:

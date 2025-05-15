@@ -18,9 +18,8 @@ from transformers import LlamaForCausalLM
 
 @dataclass
 class BenchmarkArgs:
-    batch_size: int = 24
     seq_len: int = 512
-    test_steps: int = 10
+    test_steps: int = 1000
 
 
 @dataclass
@@ -53,12 +52,13 @@ def init_args():
     parser.add_argument(
         "--base_model", type=str, required=True, help="Path to or name of base model"
     )
+    parser.add_argument("--batch_size", type=int, required=True)
     return parser.parse_args()
 
 
-def dummy_train_labels() -> torch.Tensor:
+def dummy_train_labels(args) -> torch.Tensor:
     batch_input_ids = []
-    for _ in range(0, BenchmarkArgs.batch_size):
+    for _ in range(0, args.batch_size):
         batch_input_ids.append(
             [random.randint(1, 10000) for _ in range(BenchmarkArgs.seq_len)]
         )
@@ -77,17 +77,18 @@ if __name__ == "__main__":
     world_size = int(os.environ["WORLD_SIZE"])
 
     print("To init the device mesh")
-    tp_mesh = DeviceMesh(device_type="cuda", mesh=[0, 1, 2, 3])
+    tp_mesh = DeviceMesh(device_type="cuda", mesh=list(range(world_size)))
 
     print("To load the llama model")
     model: LlamaForCausalLM = LlamaForCausalLM.from_pretrained(
-        args.base_model, use_cache=False, torch_dtype=torch.float32
+        args.base_model, use_cache=False, torch_dtype=torch.float32, device_map="cpu"
     )
     for param in model.parameters():
         param.requires_grad_(False)
 
     model.lm_head = model.lm_head.to(torch.cuda.current_device())
     model.model.embed_tokens = model.model.embed_tokens.to(torch.cuda.current_device())
+    model.model.rotary_emb = model.model.rotary_emb.to(torch.cuda.current_device())
     model.model.norm = model.model.norm.to(torch.cuda.current_device())
 
     print("To wrapper the model")
@@ -121,6 +122,7 @@ if __name__ == "__main__":
 
     print("To wrapper peft model")
     peft_args = PeftArgs()
+
     model: PeftModelForCausalLM = setup_lora_adapter(model, peft_args)
     model.print_trainable_parameters()
 
@@ -145,12 +147,11 @@ if __name__ == "__main__":
 
     optimizer = torch.optim.AdamW(model.parameters())
 
-    start_time = time.time()
-    total_tokens = 0
-
     for step in range(BenchmarkArgs.test_steps):
-        data = dummy_train_labels().to(local_rank)
-        total_tokens += data.numel()
+        data = dummy_train_labels(args).to(local_rank)
+        start_time = time.time()
+
+        total_tokens = data.numel()
 
         loss = model(input_ids=data, labels=data).loss
         loss.backward()

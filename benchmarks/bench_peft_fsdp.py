@@ -19,7 +19,6 @@ from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 
 @dataclass
 class BenchmarkArgs:
-    batch_size: int = 8
     seq_len: int = 512
     test_steps: int = 100
 
@@ -32,11 +31,11 @@ class PeftArgs:
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 
-def dummy_train_labels(benchmark_args: BenchmarkArgs) -> torch.Tensor:
+def dummy_train_labels(args) -> torch.Tensor:
     batch_input_ids = []
-    for _ in range(0, benchmark_args.batch_size):
+    for _ in range(0, args.batch_size):
         batch_input_ids.append(
-            [random.randint(1, 10000) for _ in range(benchmark_args.seq_len)]
+            [random.randint(1, 10000) for _ in range(BenchmarkArgs.seq_len)]
         )
     return torch.tensor(batch_input_ids, dtype=torch.long)
 
@@ -75,7 +74,10 @@ def create_peft_model(
 ) -> torch.distributed.fsdp.FullyShardedDataParallel:
     # init the backbone and lora adapter
     model = LlamaForCausalLM.from_pretrained(
-        train_config.model_name, use_cache=False, torch_dtype=torch.float32
+        train_config.model_name,
+        use_cache=False,
+        torch_dtype=torch.float32,
+        device_map="cpu",
     )
 
     peft_args = PeftArgs()
@@ -121,6 +123,7 @@ def init_args():
     parser.add_argument(
         "--base_model", type=str, required=True, help="Path to or name of base model"
     )
+    parser.add_argument("--batch_size", type=int, required=True)
     return parser.parse_args()
 
 
@@ -132,12 +135,10 @@ def train(
     local_rank: int,
     benchmark_args: BenchmarkArgs,
 ):
-    start_time = time.time()
-    total_tokens = 0
-
     for _ in range(benchmark_args.test_steps):
         data = labels.to(local_rank)
-        total_tokens += data.numel()
+        start_time = time.time()
+        total_tokens = data.numel()
 
         # with torch.cuda.amp.autocast():
         loss = model(input_ids=data, labels=data).loss
@@ -174,6 +175,6 @@ if __name__ == "__main__":
     optimizer = create_optimizer(fsdp_model, train_config)
 
     benchmark_args = BenchmarkArgs()
-    labels = dummy_train_labels(benchmark_args)
+    labels = dummy_train_labels(args)
 
     train(fsdp_model, optimizer, labels, rank, local_rank, benchmark_args)
