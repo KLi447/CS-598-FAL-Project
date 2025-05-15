@@ -1,0 +1,84 @@
+dispatcher:
+  name: "default"
+  concurrency_num: 1
+  log_level: "DEBUG"  # More detailed logging
+  metrics_log: true   # Enable metrics logging
+  log_dir: "experiment_logs"
+
+datasets:
+  - name: "dpo_data"
+    data: "data/hh-rlhf/train.json"
+    prompt: "prompts/dpo_prompt.yaml"
+    prompt_type: "preference"
+    preprocess: "default"
+
+
+adapters:
+  # QK adapter (rank 16)
+  - name: "lora_qk"
+    type: "lora"
+    path: "adapters/exp1_qk"
+    optimizer: "adamw"
+    lr: 3e-4
+    r: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules:
+      q_proj: true
+      k_proj: true
+      v_proj: false
+      o_proj: false
+      gate_proj: false
+      down_proj: false
+      up_proj: false
+
+  # VO adapter (rank 32)
+  - name: "lora_vo"
+    type: "lora"
+    path: "adapters/exp1_vo"
+    optimizer: "adamw"
+    lr: 3e-4
+    r: 32
+    alpha: 64
+    dropout: 0.05
+    target_modules:
+      q_proj: false
+      k_proj: false
+      v_proj: true
+      o_proj: true
+      gate_proj: false
+      down_proj: false
+      up_proj: false
+
+tasks:
+  # QK-only experiment
+  - type: "dpo"
+    name: "exp1_qk_only"
+    adapter: "lora_qk"
+    reference: "base"
+    dataset: "dpo_data"
+    batch_size: 16
+    mini_batch_size: 16
+    num_epochs: 2
+    cutoff_len: 256
+    save_step: 50
+    eval_step: 50
+    loss_type: "sigmoid"
+    beta: 0.1
+    label_smoothing: 0.0
+
+  # VO-only experiment
+  - type: "dpo"
+    name: "exp1_vo_only"
+    adapter: "lora_vo"
+    reference: "base"
+    dataset: "dpo_data"
+    batch_size: 16
+    mini_batch_size: 16
+    num_epochs: 2
+    cutoff_len: 256
+    save_step: 50
+    eval_step: 50
+    loss_type: "sigmoid"
+    beta: 0.1
+    label_smoothing: 0.0

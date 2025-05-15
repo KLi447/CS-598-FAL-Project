@@ -352,6 +352,16 @@ Or just call the script to check your code
 .github/workflows/pre-commit
 ```
 
+Make the Directory for the Anthropic RLHF Huggingface Dataset
+```bash
+   mkdir -p data/hh-rlhf
+```
+
+Download the Dataset to use for PPO Training
+```bash
+python download_dataset.py
+```
+
 ## Citation
 Please cite the repo if you use the code in this repo.
 ```bibtex
@@ -383,4 +393,9 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+```
+
+## To Perform Heterogenous PPO Training for RLHF
+```bash
+python mlora_train.py --base_model TinyLlama/TinyLlama-1.1B-Chat-v0.4 --config ppo_critic_actor.yaml --device cuda --precision fp16 --metric_file experiment_logs
 ```

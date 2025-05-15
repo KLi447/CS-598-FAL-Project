@@ -33,8 +33,7 @@ def _add_base_cmd(parser):
         help="Train the LoRA model use the pipeline parallelism",
     )
     parser.add_argument("--rank", type=int, default=-1, help="The device's rank number")
-    # parser.add_argument("--balance", type=int, nargs="+", help="The model's balance")
-    parser.add_argument("--nodes", type=int, default=1, help="number of GPU nodes to shard the model")
+    parser.add_argument("--balance", type=int, nargs="+", help="The model's balance")
     parser.add_argument(
         "--recompute",
         action=argparse.BooleanOptionalAction,
@@ -51,6 +50,8 @@ def _add_base_cmd(parser):
         default="/tmp/mlora_metric",
         help="Save metric to specific file.",
     )
+    parser.add_argument("--fast_lora", action="store_true", 
+                        help="If set, use fast (per-example) LoRA fine tuning. Otherwise use normal LoRA.")
     return parser
 
 
