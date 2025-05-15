@@ -5,7 +5,7 @@ nsys profile --trace=cuda,nvtx,osrt --stats=true --output=mlora_profile --force-
 python mlora_pp_train.py \
     --base_model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
     --trace \
-    --config kevin.yaml \
+    --config hetero_config.yaml \
     --device "cuda:0" \
     --rank 0 \
     --nodes 2 \
