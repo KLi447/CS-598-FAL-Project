@@ -347,3 +347,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 ```
+
+## To Perform Heterogenous PPO Training for RLHF
+```bash
+python mlora_train.py --base_model TinyLlama/TinyLlama-1.1B-Chat-v0.4 --config ppo_critic_actor.yaml --device cuda --precision fp16 --metric_file experiment_logs
+```
