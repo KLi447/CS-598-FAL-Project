@@ -253,6 +253,43 @@ use the `adapter ls` or `task ls` to check the tasks' status
 
 </details>
 
+## Profiling
+If you wish to run mLoRA to gather profiling results, first install Nvidia Nsight by running the following commands
+```bash
+wget https://developer.nvidia.com/downloads/assets/tools/secure/nsight-systems/2025_2/NsightSystems-linux-cli-public-2025.2.1.130-3569061.deb
+sudo apt update
+sudo apt install ./NsightSystems-linux-cli-public-2025.2.1.130-3569061.deb
+```
+
+Then, run the `run_profile.sh` bash script on each node. If you'd like to save the terminal outputs, when running
+the `run_profile.sh` bash script, run it as `./run_profile.sh > output.txt` to have that Nsight output saved to an output txt file. 
+The bash script executes the following commands:
+```bash
+export MASTER_ADDR=[PUT THE HEAD NODE ADDRESS HERE]
+export MASTER_PORT=12358
+nsys profile --trace=cuda,nvtx,osrt --stats=true --output=mlora_profile --force-overwrite true \
+python mlora_pp_train.py \
+    --base_model TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+    --trace \
+    --config [config file] \
+    --device "cuda:0" \
+    --rank [0 for head, 1 or greater for worker nodes] \
+    --nodes [count of the number of nodes] \
+    --recompute \
+    --precision fp16
+```
+However, note that you must change the `rank` and `nodes` parameters. Additionally, update the `MASTER_ADDR` parameter as well. In the future, 
+we can update the bash script to take in command line arguments to update the `rank`, `nodes`, and `MASTER_ADDR` values. 
+
+The main difference is that now we have the `nsys profile ...` command as well as the `--trace` flag in the `python mlora_pp_train.py` command.
+
+Once the command has finished, run `Ctrl/Cmd + C` on every node to initiate the shutdown. Then, leave the nodes running until it automatically closes. 
+Nsight takes some time to first wait for all daemon processes/threads to finish and then to also gather the results. Depending on your configuration file and
+your machine, this can sometimes take upwards of 15-20 minutes. You'll see the detailed profiling results outputted to the 
+terminal as well as two files saved to your local folder: `mlora_profile.sqlite` and `mlora_profile.nsys-rep`. 
+
+Then, run the `generate_nsys_results.sh` script to generate a `.csv` file containing some high-level profiling results. This bash script internally
+runs the `scripts/performance_report.py` file on the `mlora_profile.sqlite` file (more information on this can be found under the `scripts` directory).
 
 ## Why you should use mLoRA
 
