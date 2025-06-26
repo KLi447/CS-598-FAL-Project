@@ -180,6 +180,8 @@ class PipeExecutor(Executor):
 
         torch.cuda.empty_cache()
 
+    # ORIGINAL NAIVE CALCULATE COST FUNCTION WITHOUT INITIAL PROFILING
+    """
     def __calculate_costs(self):
         self.adapter_profiles: Dict[str, AdapterProfile] = {}
 
@@ -232,6 +234,107 @@ class PipeExecutor(Executor):
                 flops_per_token_fwd   = total_fwd_flops,
                 flops_per_token_bwd   = total_bwd_flops,
             )
+    """
+    # NEW IMPLEMENTATION
+    def __calculate_costs(self):
+        import gc
+        import pynvml
+
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        self.adapter_profiles: Dict[str, AdapterProfile] = {}
+        base_layers = list(self.partial_model_)
+
+        dummy_input = torch.randint(0, 1000, (1, 64), dtype=torch.long).to(self.device_)  # (batch, seq_len)
+        dummy_mask = torch.ones_like(dummy_input, dtype=torch.bool)
+
+        # Setup NVML for memory tracking
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+        for name, adapter in self.mlora_config.adapters().items():
+            adapter = adapter.export()
+            if adapter["peft_type"] != "LORA":
+                continue
+
+            r = adapter["r"]
+            targets = adapter["target_modules"]
+
+            total_params = 0
+            total_fwd_flops = 0
+            total_bwd_flops = 0
+
+            for layer in base_layers:
+                decoder = getattr(layer, "wrapper_module_", None)
+                if decoder is None:
+                    continue
+
+                # Load adapter just for this profiling run
+                decoder.load_adapter(name)
+
+                # --- FLOPs & param estimate ---
+                attn = getattr(decoder, "attn_", None)
+                if attn is not None:
+                    for proj in ("wq_", "wk_", "wv_", "wo_"):
+                        lin = getattr(attn, proj, None)
+                        real_lin = lin.weight_ if hasattr(lin, "weight_") else lin
+                        in_f, out_f = getattr(real_lin, "in_features", None), getattr(real_lin, "out_features", None)
+                        mods = r * in_f + out_f * r
+                        total_params += mods
+                        total_fwd_flops += mods
+                        total_bwd_flops += 2 * mods
+
+                mlp = getattr(decoder, "mlp_", None)
+                if mlp is not None:
+                    for proj in ("gate_", "down_", "up_"):
+                        lin = getattr(mlp, proj, None)
+                        real_lin = lin.weight_ if hasattr(lin, "weight_") else lin
+                        in_f, out_f = getattr(real_lin, "in_features", None), getattr(real_lin, "out_features", None)
+                        mods = r * in_f + out_f * r
+                        total_params += mods
+                        total_fwd_flops += mods
+                        total_bwd_flops += 2 * mods
+
+            # --- Latency measurement ---
+            input_data = MLoRAData()
+            input_data.batch_tokens_ = dummy_input
+            input_data.batch_mask_ = dummy_mask
+            input_data.data_config_ = []  # empty list, not used in forward
+            input_data.model_data_ = ModelData()
+            input_data.model_data_.batch_mask_ = dummy_mask
+            input_data.model_data_.task_name_ = [name]
+
+            torch.cuda.empty_cache()
+            gc.collect()
+
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            torch.cuda.synchronize()
+            start_event.record()
+
+            with torch.no_grad():
+                _ = self.__forward(dummy_input, input_data.model_data_)
+
+            end_event.record()
+            torch.cuda.synchronize()
+            latency_ms = start_event.elapsed_time(end_event)
+
+            meminfo = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            used_mem_MB = meminfo.used / (1024 ** 2)
+
+            param_bytes = total_params * 2 // (1024 * 1024)  # fp16
+            self.adapter_profiles[name] = AdapterProfile(
+                param_bytes=param_bytes,
+                flops_per_token_fwd=total_fwd_flops,
+                flops_per_token_bwd=total_bwd_flops,
+                latency_ms=latency_ms,
+                memory_MB=used_mem_MB
+            )
+
+            decoder.offload_adapter(name)
+
+
 
     def __head_worker_run(self):
         logging.info(f"PipeExecutor (Rank {self.rank_}) Head worker run starting")

@@ -7,6 +7,8 @@ import torch
 
 from flops_profiler.profiler import FlopsProfiler
 
+# ORIGINAL AdapterProfile
+"""
 @dataclass
 class AdapterProfile:
     def __init__(self, param_bytes, flops_per_token_fwd, flops_per_token_bwd, 
@@ -21,6 +23,28 @@ class AdapterProfile:
     def total_memory_estimate(self, batch_size, seq_length):
         act_mem = self.activation_memory * batch_size * seq_length
         grad_mem = self.param_bytes
+        opt_mem = self.optimizer_memory or (self.param_bytes * 2)
+        return self.param_bytes + act_mem + grad_mem + opt_mem
+"""
+# UPDATED AdapterProfile (bc of updated __calculate_costs)
+@dataclass
+class AdapterProfile:
+    param_bytes: int                      # Size of LoRA parameters (in bytes)
+    flops_per_token_fwd: int              # Estimated forward FLOPs
+    flops_per_token_bwd: int              # Estimated backward FLOPs
+    activation_memory: int = 0            # Per-token activation memory (bytes)
+    gradient_memory: int = 0              # Total gradient memory (bytes)
+    optimizer_memory: int = 0             # Optimizer memory (bytes)
+    latency_ms: float = 0.0               # Actual latency from torch.cuda.Event (ms)
+    used_memory_bytes: int = 0            # Total GPU memory used during profile
+    memory_bytes: int = 0                 # Theoretical memory accesses (optional)
+    memory_accesses: int = 0              # Optional: total memory access count
+    estimated_latency: float = 0.0        # Optional: model-based latency (seconds)
+    memory_bandwidth: float = 0.0         # Optional: for device profiling
+
+    def total_memory_estimate(self, batch_size, seq_length):
+        act_mem = self.activation_memory * batch_size * seq_length
+        grad_mem = self.gradient_memory or self.param_bytes
         opt_mem = self.optimizer_memory or (self.param_bytes * 2)
         return self.param_bytes + act_mem + grad_mem + opt_mem
 
