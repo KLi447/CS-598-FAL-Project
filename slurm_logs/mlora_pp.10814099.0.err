@@ -1,0 +1,10 @@
+A conda environment has been detected CONDA_PREFIX=
+/u/dsaha1/.conda/envs/mlora_env_py312 
+anaconda3_gpu is loaded. Consider running conda deactivate and reloading it.
+DeprecationWarning: 'source deactivate' is deprecated. Use 'conda deactivate'.
+srun: error: CPU binding outside of job step allocation, allocated CPUs are: 0x0000000000000001.
+srun: error: CPU binding outside of job step allocation, allocated CPUs are: 0x0000000000000001.
+srun: error: Task launch for StepId=10814099.0 failed on node gpub012: Unable to satisfy cpu bind request
+srun: error: Task launch for StepId=10814099.0 failed on node gpub077: Unable to satisfy cpu bind request
+srun: error: Application launch failed: Unable to satisfy cpu bind request
+srun: Job step aborted
