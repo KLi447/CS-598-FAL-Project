@@ -1,0 +1,7 @@
+DeprecationWarning: 'source deactivate' is deprecated. Use 'conda deactivate'.
+srun: error: CPU binding outside of job step allocation, allocated CPUs are: 0x0000000000000001.
+srun: error: CPU binding outside of job step allocation, allocated CPUs are: 0x0000000000000001.
+srun: error: Task launch for StepId=10814107.0 failed on node gpub059: Unable to satisfy cpu bind request
+srun: error: Task launch for StepId=10814107.0 failed on node gpub092: Unable to satisfy cpu bind request
+srun: error: Application launch failed: Unable to satisfy cpu bind request
+srun: Job step aborted
