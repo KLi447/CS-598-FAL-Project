@@ -25,6 +25,9 @@ class PipeDispatcher(BackendDispatcher):
         self.concurrency_num_ = config.concurrency_num_
         self.list_lock = threading.Lock()
 
+    def update_adapter_profiles(self, adapter_profiles: Dict[str, AdapterProfile]) -> None:
+        self.adapter_profiles = adapter_profiles
+
     def _compute_placement(self, candidates: List[Task]):
         gpu_state = query_all_gpus()[0]
 
@@ -53,12 +56,12 @@ class PipeDispatcher(BackendDispatcher):
             wait_boost = min(task.waiting / 20, 1.0)
             aging_score = 1.0 + (wait_boost ** 2)
 
-            logging.info(f"name: {task.task_name()} mem: {memory_score} comp: {compute_score} wait: {aging_score}")
+            # logging.info(f"name: {task.task_name()} mem: {memory_score} comp: {compute_score} wait: {aging_score}")
 
             return (0.3 * memory_score) + (0.7 * compute_score) * aging_score + (0.1 * wait_boost)
         
-        for c in candidates:
-            logging.info(f"C: {c.config_.name_}, epoch: {c.now_epoch_}, waiting: {c.waiting}, score: {score_task(c)}")
+        # for c in candidates:
+            # logging.info(f"C: {c.config_.name_}, epoch: {c.now_epoch_}, waiting: {c.waiting}, score: {score_task(c)}")
 
         # return a copy of the list so that we don't modify candidates list itself
         return sorted(candidates, key=score_task, reverse=True)
@@ -162,49 +165,58 @@ class PipeDispatcher(BackendDispatcher):
                 task for task in self.ready_ if not self.is_lock(task.task_name())
             ]
 
+            tasks_to_run: List[Task] = []
+
             if len(can_run_tasks) == 0:
                 return None
-            
-            # get all train data
-            start_idx: int = 0
-            # pipe dispatcher just run one task
 
             num_to_run = min(len(can_run_tasks), self.concurrency_num_ - len(self.running_))
             if num_to_run <= 0:
                 return None
 
-            task = self._compute_placement(can_run_tasks)[0]
-            logging.info(f"Selected task: {task.task_name()}")
+            sorted_candidates = self._compute_placement(can_run_tasks)
 
-            for t in self.ready_:
-                if t != task:
-                    t.waiting += 1
+            for task in sorted_candidates:
+                if len(tasks_to_run) >= num_to_run:
+                    break
+
+                tasks_to_run.append(task)
+                logging.info(f"Selected task: {task.task_name()}")
+
+            if not tasks_to_run:
+                return None
+
+            scheduled_task_names = {t.task_name() for t in tasks_to_run}
+            for task in self.ready_:
+                if task.task_name() not in scheduled_task_names:
+                    task.waiting += 1
                 else:
-                    t.waiting = 0
+                    task.waiting = 0
 
-            try:
-                self.ready_.remove(task)
-                self.running_.append(task)
-                self.running_event_.notify(task)
-                self.lock_task(task.task_name())
-                logging.info(f"Task {task.task_name()} moved to running.")
-            except ValueError:
-                    # Handle error: maybe skip task, maybe raise exception
-                    return None
+            start_idx = 0
+            for task in tasks_to_run:
+                try:
+                    self.ready_.remove(task)
+                    self.running_.append(task)
+                    self.running_event_.notify(task)
+                    self.lock_task(task.task_name())
+                    logging.info(f"Task {task.task_name()} moved to running.")
 
-            data, data_config = task.data(start_idx)
+                    data, data_config = task.data(start_idx)
+                    for item in data_config:
+                        item.task_name_ = task.task_name()
 
-        # for unlock the task
-            for item in data_config:
-                item.task_name_ = task.task_name()
+                    data_configs.extend(data_config)
+                    batch_tokens.extend(data)
+                    start_idx += len(data)
 
-            data_configs.extend(data_config)
-            batch_tokens.extend(data)
-            start_idx = start_idx + len(data)
-            self.lock_task(task.task_name())
+                except ValueError:
+                    continue
 
-        # post process this batch data
-            batch_tokens, batch_masks = self._align_batch_tokens(batch_tokens, data_configs)
+        if not batch_tokens:
+            return None
+
+        batch_tokens, batch_masks = self._align_batch_tokens(batch_tokens, data_configs)
 
         return MLoRAData(
             batch_tokens=batch_tokens, batch_mask=batch_masks, data_config=data_configs

@@ -45,5 +45,6 @@ if __name__ == "__main__":
     if args.rank == 0:
         for item in config.tasks_:
             executor.add_task(item)
+        executor.calculate_costs()
 
     executor.execute()

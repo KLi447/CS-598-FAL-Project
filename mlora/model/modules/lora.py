@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple, override
 
 import torch
 import torch.nn.functional as F
+from torch.nn import Parameter
 
 from mlora.backends import MPSBackend, get_backend
 from mlora.model.args import ModelData
@@ -195,11 +196,11 @@ class LoRA(Adapter):
     ):
         super().__init__("lora", adapter_name)
 
-        self.lora_a_: torch.Tensor = torch.zeros(
-            size=(r, in_dim), device="cpu", requires_grad=True, dtype=torch.float32
+        self.lora_a_: torch.Tensor = Parameter(
+            torch.empty(size=(r, in_dim), device="cpu", dtype=torch.float32)
         )
-        self.lora_b_: torch.Tensor = torch.zeros(
-            size=(out_dim, r), device="cpu", requires_grad=True, dtype=torch.float32
+        self.lora_b_: torch.Tensor = Parameter(
+            torch.zeros(size=(out_dim, r), device="cpu", dtype=torch.float32)
         )
 
         self.r_: int = r

@@ -1,6 +1,7 @@
 from typing import Callable, List, MutableMapping, Optional, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from mlora.model.args import ModelData
@@ -33,7 +34,7 @@ class Linear(torch.nn.Module):
 
         self.device_ = weight.weight.device
         self.weight_ = weight
-        self.adapters_: MutableMapping[str, Adapter] = {}
+        self.adapters_: MutableMapping[str, Adapter] = torch.nn.ModuleDict({})
 
     def forward(self, data: torch.Tensor, input_args: ModelData) -> torch.Tensor:
         # data shape is: batch_size * max_seq_len * dim
@@ -81,12 +82,18 @@ class Linear(torch.nn.Module):
             )
             dropouts.append(self.adapters_[adapter_name].dropout_)
             scalings.append(self.adapters_[adapter_name].scaling_)
+        
+            adapter = self.adapters_[adapter_name]
 
-        with nvtx_range("f_lora"):
-            result = LoRAFunction.apply(
-                result, data, input_args, dropouts, scalings, *loras
-            )
-        set_backward_tracepoint(result.grad_fn, "b_lora")
+            with nvtx_range("f_lora"):
+                lora_data = F.dropout(data, p=adapter.dropout_, training=True)
+                lora_a_weight = adapter.lora_a_.to(lora_data.dtype)
+                lora_data = lora_data @ lora_a_weight.transpose(0, 1)
+                lora_b_weight = adapter.lora_b_.to(lora_data.dtype)
+                lora_data = lora_data @ lora_b_weight.transpose(0, 1)
+                lora_data = lora_data * adapter.scaling_
+                result = result + lora_data
+            set_backward_tracepoint(result.grad_fn, "b_lora")
 
         return result
 
