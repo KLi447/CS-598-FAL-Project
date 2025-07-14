@@ -3,12 +3,22 @@ from typing import Tuple
 
 from transformers import AutoModel
 
-from mlora.model.llm import LlamaModel, LLMModel
+from mlora.model.llm import LLMModel, QwenModel, LlamaModel
 from mlora.model.tokenizer import Tokenizer
+
+from huggingface_hub import login
+
+import os
 
 MODEL_TYPE_DICT = {
     "llama": LlamaModel,
+    "qwen": QwenModel,
 }
+
+hf_token = os.getenv("HUGGING_FACE_TOKEN") 
+
+if hf_token:
+    login(token=hf_token)
 
 
 def load_partial_model(args) -> LLMModel:
@@ -19,11 +29,23 @@ def load_partial_model(args) -> LLMModel:
     logging.info(
         f"Pipeline parallelism, rank is {args.rank} and distributed over {args.nodes} nodes."
     )
-    model = LlamaModel.from_pretrained(
-        path=args.base_model,
-        device=args.device,
-        precision=args.precision,
+
+    logging.info(
+        f"Using base model: {args.base_model}"
     )
+
+    if "llama" in args.base_model.lower():
+        model = LlamaModel.from_pretrained(
+            path=args.base_model,
+            device=args.device,
+            precision=args.precision,
+        )
+    if "qwen" in args.base_model.lower():
+        model = QwenModel.from_pretrained(
+            path=args.base_model,
+            device=args.device,
+            precision=args.precision,
+        )
     seq_model = model.sequential()
     num_layers = len(seq_model)
 
@@ -62,9 +84,15 @@ def load_model(args) -> Tuple[Tokenizer, LLMModel]:
 
     tokenizer = Tokenizer(args.base_model)
 
+    if args.model_type == "qwen": ##FIXME
+        tokenizer.bos_id_ = tokenizer.eos_id_
+
     if args.pipeline:
         model = load_partial_model(args)
     else:
         model = load_full_model(args)
+
+    if args.model_type == "qwen": ##FIXME
+        model.pad_token_id_ = tokenizer.pad_id_
 
     return tokenizer, model

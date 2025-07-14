@@ -43,12 +43,15 @@ class LLMModelArgs:
         self.hidden_dropout_ = 0.0
         self.vocab_size_ = config.vocab_size
         self.pad_token_id_ = config.pad_token_id
+        self.bos_token_id_ = config.bos_token_id
+        self.eos_token_id_ = config.eos_token_id
         self.max_seq_len_ = 4096
         if hasattr(config, "max_sequence_length"):
             self.max_seq_len_ = config.max_sequence_length
 
         if (
             hasattr(config, "sliding_window")
+            and config.sliding_window is not None
             and self.max_seq_len_ > config.sliding_window
         ):
             logging.warning(
