@@ -16,6 +16,8 @@
 #
 # Github:  https://github.com/TUDB-Labs/mLoRA
 
+import os
+
 import mlora.model
 import mlora.utils
 import mlora.executor
@@ -23,6 +25,11 @@ import mlora.config
 
 if __name__ == "__main__":
     args = mlora.utils.get_cmd_args()
+
+    r = os.environ['LOCAL_RANK']
+    args.rank = int(r)
+    args.device += str(r)
+    args.nodes = 2
 
     mlora.utils.setup_seed(args.seed)
     mlora.utils.setup_logging(args.log_level, args.log_file)

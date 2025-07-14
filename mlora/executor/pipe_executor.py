@@ -1,6 +1,9 @@
 import logging
 import time
 import uuid
+import subprocess
+import threading
+from datetime import datetime
 from enum import Enum, auto
 from typing import Any, Dict, List, OrderedDict, cast
 
@@ -77,6 +80,8 @@ class PipeExecutor(Executor):
 
         self.recompute_ = recompute
 
+        self.timings = {}
+
         self.__init_worker()
         self.__init_partition()
 
@@ -90,6 +95,18 @@ class PipeExecutor(Executor):
         self.dispatcher_: PipeDispatcher = cast(
             PipeDispatcher, DISPATCHER_CLASS["pipe"](config.dispatcher_)
         )
+
+        self.logger_ = logging.getLogger(f"PipeExecutor-{self.rank_}")
+        file_handler = logging.FileHandler(f"worker_{self.rank_}_metrics.log")
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        self.logger_.addHandler(file_handler)
+        self.logger_.setLevel(logging.INFO)
+
+        self.gpu_monitoring_thread_ = threading.Thread(
+            target=self.__monitor_gpu_utilization, daemon=True
+        )
+        self.gpu_monitoring_thread_.start()
 
         hook_func = {
             "init": self.__task_init_hook,
@@ -139,6 +156,35 @@ class PipeExecutor(Executor):
         del self.model_
 
         torch.cuda.empty_cache()
+
+    def __monitor_gpu_utilization(self):
+        device_index = self.rank_
+        while True:
+            try:
+                result = subprocess.run(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=utilization.gpu,memory.used,memory.total",
+                        "--format=csv,noheader,nounits",
+                        "-i", str(device_index)
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                output = result.stdout.strip()
+                if output:
+                    gpu_util, mem_used, mem_total = map(int, output.split(","))
+                    mem_percent = (mem_used / mem_total) * 100
+                    self.logger_.info(
+                        f"[GPU{device_index}] GPU Utilization: {gpu_util}% | "
+                        f"Memory Used: {mem_used}MB / {mem_total}MB ({mem_percent:.1f}%)"
+                    )
+                else:
+                    self.logger_.warning(f"[GPU{device_index}] Empty output from nvidia-smi")
+            except Exception as e:
+                self.logger_.error(f"Error reading GPU utilization: {str(e)}")
+            time.sleep(0.1)
 
     def __head_worker_run(self):
         while True:
@@ -280,11 +326,22 @@ class PipeExecutor(Executor):
         if total_loss is not None:
             total_loss.backward()
 
+        if message.model_data_.random_id_ in self.timings:
+            start_time = self.timings[message.model_data_.random_id_]
+            iter_latency = time.time() - start_time
+            logging.info(
+                f"Iteration latency (Rank {self.rank_}, Task {message.model_data_.task_name_[0]}): {iter_latency:.4f} seconds"
+            )
+            del self.timings[message.model_data_.random_id_]
+
     def __process_input(self):
         train_data: MLoRAData | None = self.dispatcher_.data()
         if train_data is None:
             return
         # step1. get the model data and execute the forward
+
+        self.timings[train_data.model_data().random_id_] = time.time()
+
         tensor_data = torch.tensor(
             train_data.batch_tokens_,
             dtype=torch.long,
