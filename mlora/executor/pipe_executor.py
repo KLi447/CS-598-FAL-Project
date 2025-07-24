@@ -28,9 +28,9 @@ from .task import Task
 from flops_profiler.profiler import get_model_profile
 from collections import namedtuple
 
-from pynvml import *
+import pynvml
 
-nvmlInit()
+pynvml.nvmlInit()
 handle = nvmlDeviceGetHandleByIndex(0)
 
 

@@ -12,9 +12,9 @@ from mlora.model.tokenizer import Tokenizer
 from .dispatcher import DISPATCHER_CLASS, Dispatcher
 from .task import Task
 
-from pynvml import *
+import pynvml
 
-nvmlInit()
+pynvml.nvmlInit()
 handle = nvmlDeviceGetHandleByIndex(0)
 
 
