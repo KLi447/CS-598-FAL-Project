@@ -15,7 +15,7 @@ from .task import Task
 import pynvml
 
 pynvml.nvmlInit()
-handle = nvmlDeviceGetHandleByIndex(0)
+handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
 
 class Executor:
@@ -127,7 +127,7 @@ class Executor:
                 total_loss.backward()
 
             peak_memory = torch.cuda.max_memory_allocated(device=self.model_.device_)
-            utilization = nvmlDeviceGetUtilizationRates(handle)
+            utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
             logging.info(f"  Peak GPU Memory Usage: {peak_memory / 1024**3:.2f} GB")
             logging.info(f"  GPU Compute Utilization: {utilization.gpu} %")
             logging.info(f"  GPU Memory Utilization: {utilization.memory} %")

@@ -31,7 +31,7 @@ from collections import namedtuple
 import pynvml
 
 pynvml.nvmlInit()
-handle = nvmlDeviceGetHandleByIndex(0)
+handle = pynvml.nvmlDeviceGetHandleByIndex(0)
 
 
 class WorkerRole(Enum):
@@ -391,7 +391,7 @@ class PipeExecutor(Executor):
         current_device = torch.cuda.current_device()
 
         peak_memory = torch.cuda.max_memory_allocated(current_device)
-        utilization = nvmlDeviceGetUtilizationRates(handle)
+        utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
         logging.info(f"  Peak GPU Memory Usage: {peak_memory / 1024**3:.2f} GB")
         logging.info(f"  GPU Compute Utilization: {utilization.gpu} %")
         logging.info(f"  GPU Memory Utilization: {utilization.memory} %")
