@@ -12,6 +12,11 @@ from mlora.model.tokenizer import Tokenizer
 from .dispatcher import DISPATCHER_CLASS, Dispatcher
 from .task import Task
 
+from pynvml import *
+
+nvmlInit()
+handle = nvmlDeviceGetHandleByIndex(0)
+
 
 class Executor:
     model_: LLMModel
@@ -120,6 +125,12 @@ class Executor:
 
             if total_loss is not None:
                 total_loss.backward()
+
+            peak_memory = torch.cuda.max_memory_allocated(device=self.model_.device_)
+            utilization = nvmlDeviceGetUtilizationRates(handle)
+            logging.info(f"  Peak GPU Memory Usage: {peak_memory / 1024**3:.2f} GB")
+            logging.info(f"  GPU Compute Utilization: {utilization.gpu} %")
+            logging.info(f"  GPU Memory Utilization: {utilization.memory} %")
 
             self.dispatcher_.step()
             mm_collect_step += 1

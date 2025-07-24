@@ -1,5 +1,5 @@
 import math
-from typing import override
+from typing import override, List
 
 import torch
 
@@ -65,5 +65,5 @@ class DoRA(LoRA):
         return weight_norm
 
     @override
-    def get_all_tensors(self) -> torch.List[torch.Tensor]:
+    def get_all_tensors(self) -> List[torch.Tensor]:
         return [self.lora_a_, self.lora_b_, self.magnitude_]

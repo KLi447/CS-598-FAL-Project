@@ -30,10 +30,6 @@ def load_partial_model(args) -> LLMModel:
         f"Pipeline parallelism, rank is {args.rank} and distributed over {args.nodes} nodes."
     )
 
-    logging.info(
-        f"Using base model: {args.base_model}"
-    )
-
     if "llama" in args.base_model.lower():
         model = LlamaModel.from_pretrained(
             path=args.base_model,

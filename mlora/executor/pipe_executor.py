@@ -28,6 +28,11 @@ from .task import Task
 from flops_profiler.profiler import get_model_profile
 from collections import namedtuple
 
+from pynvml import *
+
+nvmlInit()
+handle = nvmlDeviceGetHandleByIndex(0)
+
 
 class WorkerRole(Enum):
     HEAD = auto()
@@ -92,8 +97,8 @@ class PipeExecutor(Executor):
 
         self.default_stream_ = CudaStream(torch.cuda.default_stream(self.device_))
         
-        n = len(self.mlora_config.adapters().items())
-        # n = config.dispatcher_.concurrency_num_
+        # n = len(self.mlora_config.adapters().items())
+        n = config.dispatcher_.concurrency_num_
 
         # init the rpc and wait the cluster node ready
         self.transport_ = RpcTransport(
@@ -150,6 +155,7 @@ class PipeExecutor(Executor):
         )
 
         for idx in range(start_module_idx, end_module_idx):
+            # logging.info(seq_model[idx])
             self.partial_model_.append(seq_model[idx])
 
         assert len(self.partial_model_) == balance[self.rank_]
@@ -381,6 +387,14 @@ class PipeExecutor(Executor):
             total_loss.backward()
         else:
             logging.warning("Batch produced no loss value.")
+
+        current_device = torch.cuda.current_device()
+
+        peak_memory = torch.cuda.max_memory_allocated(current_device)
+        utilization = nvmlDeviceGetUtilizationRates(handle)
+        logging.info(f"  Peak GPU Memory Usage: {peak_memory / 1024**3:.2f} GB")
+        logging.info(f"  GPU Compute Utilization: {utilization.gpu} %")
+        logging.info(f"  GPU Memory Utilization: {utilization.memory} %")
 
     def __process_input(self):
         train_data: MLoRAData | None = self.dispatcher_.data()
