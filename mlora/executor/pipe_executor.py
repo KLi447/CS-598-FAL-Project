@@ -30,10 +30,6 @@ from collections import namedtuple
 
 import pynvml
 
-pynvml.nvmlInit()
-handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-
-
 class WorkerRole(Enum):
     HEAD = auto()
     MID = auto()
@@ -89,11 +85,17 @@ class PipeExecutor(Executor):
 
         self.backward_cache_ = {}
         self.input_cache_ = {}
+        self.latency_events_ = {}
 
         self.recompute_ = recompute
 
         self.__init_worker()
         self.__init_partition()
+
+        a = 0
+        for partial_layer in self.partial_model_:
+            logging.info(f"Layer {a}: {partial_layer.name()}")
+            a += 1
 
         self.default_stream_ = CudaStream(torch.cuda.default_stream(self.device_))
         
@@ -121,6 +123,45 @@ class PipeExecutor(Executor):
 
         for hook, cb in hook_func.items():
             self.dispatcher_.register_hook(hook, cb)
+
+    def _poll_gpu_stats(self, stop_event: threading.Event, results: List[int]):
+        try:
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(int(self.device_.split(":")[-1]))
+            while not stop_event.is_set():
+                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+                results.append(util.gpu)
+                time.sleep(0.01)  # Poll every 10ms
+        except Exception as e:
+            logging.warning(f"GPU poll thread failed: {e}")
+        finally:
+            pynvml.nvmlShutdown()
+
+    def _start_gpu_monitor(self) -> Tuple[threading.Event, List[int], threading.Thread]:
+        stop_event = threading.Event()
+        util_results = []
+        monitor_thread = threading.Thread(
+            target=self._poll_gpu_stats, args=(stop_event, util_results), daemon=True
+        )
+        monitor_thread.start()
+        return stop_event, util_results, monitor_thread
+
+    def _stop_gpu_monitor(
+        self,
+        context: str,
+        stop_event: threading.Event,
+        util_results: List[int],
+        monitor_thread: threading.Thread,
+    ):
+        stop_event.set()
+        monitor_thread.join()
+        if util_results:
+            avg_util = sum(util_results) / len(util_results)
+            max_util = max(util_results)
+            logging.info(
+                f"GPU UTIL @ {context} (Rank {self.rank_}): "
+                f"Avg: {avg_util:.2f}%, Max: {max_util}%"
+            )
 
     def __init_worker(self):
         # init the different worker
@@ -164,6 +205,12 @@ class PipeExecutor(Executor):
         if end_module_idx < sum(balance) - 1:
             del seq_model[end_module_idx+1:]
         del self.model_
+
+        self.partial_model_.to_empty(device=self.device_)
+
+        for name, module in self.partial_model_.named_modules():
+            if hasattr(module, "reset_parameters"):
+                module.reset_parameters()
 
         torch.cuda.empty_cache()
 
@@ -218,10 +265,10 @@ class PipeExecutor(Executor):
             param_bytes = (params * 2) / (1024 * 1024)
             bwd_flops = fwd_flops * 2
             adapter_profiles[name] = AdapterProfile(
-                param_bytes=param_bytes,
-                flops_per_token_fwd=fwd_flops,
-                flops_per_token_bwd=bwd_flops,
-                latency_ms=latency_ms,
+                param_bytes=1,
+                flops_per_token_fwd=1,
+                flops_per_token_bwd=1,
+                latency_ms=1,
             )
             logging.info(f"... Profile for {name}: {adapter_profiles[name]}")
 
@@ -288,7 +335,48 @@ class PipeExecutor(Executor):
         gradient_tensor = message.tensor_data_.to(self.device_)
         phony.grad_fn.grad_from_next_worker = gradient_tensor
 
-        phony.backward()
+        if self.role_ == WorkerRole.HEAD:
+            bwd_start_event = torch.cuda.Event(enable_timing=True)
+            bwd_end_event = torch.cuda.Event(enable_timing=True)
+
+            bwd_start_event.record()
+            stop_event, results, thread = self._start_gpu_monitor()
+            
+            phony.backward()
+
+            self._stop_gpu_monitor("Backward Pass", stop_event, results, thread)
+            bwd_end_event.record()
+
+            model_data = message.model_data_
+            batch_id = model_data.random_id_
+            
+            # Check if we have a start event for this batch
+            if batch_id in self.latency_events_:
+                start_event = self.latency_events_.pop(batch_id) # pop to clean up
+                end_event = torch.cuda.Event(enable_timing=True)
+                end_event.record()
+                
+                torch.cuda.synchronize()
+                
+                total_latency_ms = start_event.elapsed_time(end_event)
+                logging.info(
+                    f"   Total Batch Latency (Fwd->Bwd): {total_latency_ms:.4f} ms"
+                )
+        else:
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            
+            start_event.record()
+            stop_event, results, thread = self._start_gpu_monitor()
+    
+            phony.backward()
+
+            self._stop_gpu_monitor("Backward Pass", stop_event, results, thread)
+            end_event.record()
+            
+            torch.cuda.synchronize()
+            latency_ms = start_event.elapsed_time(end_event)
+            logging.info(f"   Backward Pass Latency (Rank {self.rank_}): {latency_ms:.4f} ms")
 
         if self.role_ == WorkerRole.HEAD:
             self.__head_process_step(message)
@@ -317,8 +405,21 @@ class PipeExecutor(Executor):
         # and then send it, so we hook the pre stage fn to poll the stream
         data.grad_fn.pre_stage_fn = self.default_stream_.poll  # type: ignore
         assert message.model_data_ is not None
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        
+        start_event.record()
+        stop_event, results, thread = self._start_gpu_monitor()
         
         data = self.__forward(data, message.model_data_)
+
+        self._stop_gpu_monitor("Mid/Tail Forward Pass", stop_event, results, thread)
+        end_event.record()
+        
+        torch.cuda.synchronize() # Wait for the forward pass to complete
+        latency_ms = start_event.elapsed_time(end_event)
+        logging.info(f"   Forward Pass Latency (Rank {self.rank_}): {latency_ms:.4f} ms")
 
         self.default_stream_.poll()
         assert message.model_data_ is not None
@@ -388,14 +489,6 @@ class PipeExecutor(Executor):
         else:
             logging.warning("Batch produced no loss value.")
 
-        current_device = torch.cuda.current_device()
-
-        peak_memory = torch.cuda.max_memory_allocated(current_device)
-        utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
-        logging.info(f"  Peak GPU Memory Usage: {peak_memory / 1024**3:.2f} GB")
-        logging.info(f"  GPU Compute Utilization: {utilization.gpu} %")
-        logging.info(f"  GPU Memory Utilization: {utilization.memory} %")
-
     def __process_input(self):
         train_data: MLoRAData | None = self.dispatcher_.data()
         if train_data is None:
@@ -412,12 +505,17 @@ class PipeExecutor(Executor):
         end_event = torch.cuda.Event(enable_timing=True)
 
         start_event.record()
+        stop_event, results, thread = self._start_gpu_monitor()
+        self.latency_events_[train_data.model_data().random_id_] = start_event
+
         hidden_data = self.__forward(tensor_data, train_data.model_data())
+
+        self._stop_gpu_monitor("Mid/Tail Forward Pass", stop_event, results, thread)
         end_event.record()
         torch.cuda.synchronize()
         latency_ms = start_event.elapsed_time(end_event)
 
-        logging.info(f"    Total Batch Latency: {latency_ms:.4f} ms")
+        logging.info(f"    Head Node Forward Latency: {latency_ms:.4f} ms")
 
         # step2. then send the hidden state to next worker
         self.default_stream_.poll()

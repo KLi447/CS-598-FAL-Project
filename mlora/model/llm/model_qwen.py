@@ -185,6 +185,7 @@ class QwenModel(LLMModel):
                 # Be careful, this is hard coded.
                 weight_map = [
                     "model.embed_tokens",
+                    "model.rotary_emb",
                     *[
                         f"model.layers.{layer_id}"
                         for layer_id in range(0, config.num_hidden_layers)
@@ -226,7 +227,7 @@ class QwenModel(LLMModel):
                 bnb_4bit_quant_type=precision,
             )
 
-        qwen_model = AutoModelForCausalLM.from_pretrained(path, **additional_load_args)
+        qwen_model = AutoModelForCausalLM.from_pretrained(path, trust_remote_code=True, **additional_load_args)
 
         if qwen_model.config.model_type not in QwenCompatibleModelTypes:
             raise AssertionError(f"Unsupported model type {qwen_model.config.model_type}. Expected one of {QwenCompatibleModelTypes}.")
