@@ -357,6 +357,11 @@ class PipeExecutor(Executor):
                 end_event.record()
                 
                 torch.cuda.synchronize()
+
+                bwd_latency_ms = bwd_start_event.elapsed_time(bwd_end_event)
+                logging.info(
+                    f"   Head Backward Pass Latency: {bwd_latency_ms:.4f} ms"
+                )
                 
                 total_latency_ms = start_event.elapsed_time(end_event)
                 logging.info(
