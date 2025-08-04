@@ -58,8 +58,11 @@ class TensorParallelDispatcher(BackendDispatcher):
             adapter_name = task.adapter_name()[0]
             prof = self.adapter_profiles_[adapter_name]
 
-            task_mem_estimate = prof.activations_memory_estimate(task.config_.batch_size_, 256) / self.tp_world_size_
-            task_mem_estimate += prof.adapter_memory_estimate()
+            act_mem = (prof.activation_memory * task.config_.batch_size_ * 256) / self.tp_world_size_
+
+            adapter_mem = prof.param_bytes
+
+            task_mem_estimate = act_mem + adapter_mem
 
             if estimated_mem_usage + task_mem_estimate > free_memory:
                 logging.info(f"Skipping task {task.task_name()} due to memory constraints.")
@@ -67,7 +70,7 @@ class TensorParallelDispatcher(BackendDispatcher):
 
             selected_tasks.append(task)
             estimated_mem_usage += task_mem_estimate
-            max_tokens_in_batch += task.config_.batch_size_ * 256
+            max_tokens_in_batch += task.config_.batch_size_ * 256 # A rough estimate
 
         logging.info(f"Selected {len(selected_tasks)} tasks for the next batch.")
         return selected_tasks

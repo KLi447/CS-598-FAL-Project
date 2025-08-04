@@ -70,11 +70,10 @@ if __name__ == "__main__":
             model, tokenizer, config, args.device, args.rank, args.nodes
         )
 
-        if args.rank == 0:
-            for item in config.tasks_:
-                executor.add_task(item)
+        for item in config.tasks_:
+            executor.add_task(item)
 
-                executor.calculate_costs() #not implemented
+            executor.calculate_costs() #not implemented
 
         executor.execute()
 

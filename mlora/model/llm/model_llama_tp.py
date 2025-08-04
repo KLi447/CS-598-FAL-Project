@@ -135,6 +135,11 @@ class TensorParallelAttention(torch.nn.Module):
         k = self.k_proj(x).view(batch_size, seq_len, self.n_kv_heads_per_partition, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_kv_heads_per_partition, self.head_dim).transpose(1, 2)
 
+        num_query_groups = self.n_heads_per_partition // self.n_kv_heads_per_partition
+        if num_query_groups > 1:
+            k = k.repeat_interleave(num_query_groups, dim=1)
+            v = v.repeat_interleave(num_query_groups, dim=1)
+
         scores = torch.matmul(q, k.transpose(2, 3)) / (self.head_dim ** 0.5)
         if mask is not None:
             scores = scores + mask
@@ -187,44 +192,71 @@ class TensorParallelDecoderLayer(torch.nn.Module):
         for name, module in self.named_modules():
             submodule_name = name.split('.')[-1]
             if isinstance(module, ColumnParallelLinear):
-                info[submodule_name] = LinearInfo(module.weight.shape[1], module.out_features_per_partition * world_size)
+                info[name] = LinearInfo(
+                    name_=submodule_name,
+                    in_dim_=module.weight.shape[1], 
+                    out_dim_=module.out_features_per_partition * world_size, 
+                    base_weight_=module
+                )
             elif isinstance(module, RowParallelLinear):
-                info[submodule_name] = LinearInfo(module.in_features_per_partition * world_size, module.weight.shape[0])
+                info[name] = LinearInfo(
+                    name_=submodule_name,
+                    in_dim_=module.in_features_per_partition * world_size, 
+                    out_dim_=module.weight.shape[0], 
+                    base_weight_=module
+                )
         return info
 
-    def load_adapter(self, adapter_model: AdapterModel):
+    def load_adapter(self, layer_prefix: str, adapter_name: str, adapter_config: dict):
         rank = get_tensor_parallel_rank()
         world_size = get_tensor_parallel_world_size()
-        self.adapters[adapter_model.name] = []
-        
-        for name, base_layer in self.named_modules():
-            clean_name = name.split('.')[-1]
-            if clean_name not in adapter_model.target_modules:
+
+        if adapter_name not in self.adapters:
+            self.adapters[adapter_name] = []
+
+        for full_layer_name, lora_config in adapter_config.items():
+            if not full_layer_name.startswith(f"{layer_prefix}."):
+                continue
+    
+            submodule_path = full_layer_name.replace(f"{layer_prefix}.", "", 1)
+            try:
+                base_layer = self.get_submodule(submodule_path)
+            except AttributeError:
+                logging.warning(f"Could not find submodule {submodule_path} in layer {layer_prefix}")
                 continue
 
-            lora_a_full = adapter_model.lora_a_weights[clean_name]
-            lora_b_full = adapter_model.lora_b_weights[clean_name]
+            lora_a_full = lora_config.lora_a_
+            lora_b_full = lora_config.lora_b_
             
             if isinstance(base_layer, ColumnParallelLinear):
-                lora_b_sharded = lora_b_full.chunk(world_size, dim=0)[rank]
-                lora_a_sharded = lora_a_full
+                in_dim = base_layer.weight.shape[1]
+                out_dim = base_layer.out_features_per_partition * world_size
             elif isinstance(base_layer, RowParallelLinear):
-                lora_a_sharded = lora_a_full.chunk(world_size, dim=1)[rank]
-                lora_b_sharded = lora_b_full
+                in_dim = base_layer.in_features_per_partition * world_size
+                out_dim = base_layer.weight.shape[0]
             else:
                 continue
             
+        if lora_a_full.shape[1] != in_dim:
+            raise ValueError(f"LoRA A matrix for {full_layer_name} has incorrect in_features: "
+                             f"expected {in_dim}, got {lora_a_full.shape[1]}")
+        if lora_b_full.shape[0] != out_dim:
+            raise ValueError(f"LoRA B matrix for {full_layer_name} has incorrect out_features: "
+                             f"expected {out_dim}, got {lora_b_full.shape[0]}")
+            
             lora_layer = TensorParallelLoRALayer(
-                base_layer, adapter_model.r, adapter_model.scaling, 
-                lora_a_sharded.to(base_layer.weight.device), 
-                lora_b_sharded.to(base_layer.weight.device)
+                base_layer,
+                r=lora_config.r_,
+                scaling=lora_config.scaling_,
+                lora_a=lora_a_sharded.to(base_layer.weight.device),
+                lora_b=lora_b_sharded.to(base_layer.weight.device)
             )
-
+            
             def hook(module, input, output):
                 return output + lora_layer(input[0])
             
             hook_handle = base_layer.register_forward_hook(hook)
-            self.adapters[adapter_model.name].append({"name": name, "hook": hook_handle})
+            self.adapters[adapter_name].append({"name": full_layer_name, "hook": hook_handle})
 
     def offload_adapter(self, adapter_name: str):
         if adapter_name not in self.adapters: return
@@ -243,6 +275,7 @@ class LlamaModel_TP(LLMModel):
         super().__init__()
         
         self.args = args
+        self.name_or_path_ = args.name_or_path_
         self.vocab_size_ = args.vocab_size_
         self.pad_token_id_ = args.pad_token_id_
         self.device_ = args.device_
@@ -275,16 +308,43 @@ class LlamaModel_TP(LLMModel):
         config = AutoConfig.from_pretrained(path)
         llama_args = LLMModelArgs(config)
         llama_args.device_ = device
-        dtype = {"fp16": torch.float16, "bf16": torch.bfloat16, "fp32": torch.float32}[precision]
-        llama_args.dtype_ = dtype
+
+        load_type_dict = {
+            "fp32": torch.float32,
+            "fp16": torch.float16,
+            "bf16": torch.bfloat16,
+        }
+
+        additional_load_args = {
+            "low_cpu_mem_usage": True
+        }
+
+        if precision in load_type_dict:
+            additional_load_args["torch_dtype"] = load_type_dict[precision]
+        else:
+            load_4bit = precision in ["nf4", "fp4"]
+            load_8bit = precision == "int8"
+
+            additional_load_args["torch_dtype"] = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            additional_load_args["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=load_4bit,
+                load_in_8bit=load_8bit,
+                llm_int8_enable_fp32_cpu_offload=True,
+                llm_int8_has_fp16_weight=False,
+                bnb_4bit_compute_dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type=precision,
+            )
+        
+        llama_args.dtype_ = additional_load_args["torch_dtype"]
 
         with torch.device('meta'):
             model = LlamaModel_TP(llama_args, config)
 
-        logging.info(f"Rank {rank} loading checkpoint from disk...")
-        hf_model = AutoModelForCausalLM.from_pretrained(
-            path, torch_dtype=dtype, low_cpu_mem_usage=True
-        )
+        model.to_empty(device=device)
+
+        logging.info(f"Rank {rank} loading checkpoint from disk with precision {precision}...")
+        hf_model = AutoModelForCausalLM.from_pretrained(path, **additional_load_args)
         state_dict = {k.replace("model.", ""): v for k, v in hf_model.state_dict().items()}
         del hf_model
 
@@ -303,15 +363,14 @@ class LlamaModel_TP(LLMModel):
             else: # Replicated weights
                 model.get_submodule(module_path).get_parameter(param_name).data.copy_(param)
 
-        model.to(device)
         logging.info(f"Rank {rank} successfully loaded its shard of the model to {device}.")
         del state_dict
         return model
 
     @override
-    def load_adapter(self, adapter_model: AdapterModel):
-        for layer in self.layers:
-            layer.load_adapter(adapter_model)
+    def load_adapter(self, adapter_name: str, adapter_config: dict):
+        for i, layer in enumerate(self.layers):
+            layer.load_adapter(f"layers.{i}", adapter_name, adapter_config)
 
     @override
     def offload_adapter(self, adapter_name: str):

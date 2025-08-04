@@ -108,8 +108,21 @@ class TPExecutor(Executor):
             )
 
     def calculate_costs(self):
-        # skipped for now
-        pass
+        ##FIXME
+        adapter_profiles = {}
+        for task in self.dispatcher_.ready_:
+            name = task.config_.adapter_.name_
+            logging.info(f"Creating dummy profile for: {name}")
+
+            adapter_profiles[name] = AdapterProfile(
+                param_bytes=1,
+                flops_per_token_fwd=1,
+                flops_per_token_bwd=1,
+                latency_ms=1,
+            )
+            logging.info(f"... Dummy profile for {name}: {adapter_profiles[name]}")
+
+        self.dispatcher_.update_adapter_profiles(adapter_profiles)
 
     def execute(self) -> None:
         while True:
@@ -134,7 +147,7 @@ class TPExecutor(Executor):
         fwd_start_event.record()
         stop_event, results, thread = self._start_gpu_monitor()
 
-        output = self.model_(tokens, train_data.model_data())
+        output = self.model_(train_data.model_data())
 
         self._stop_gpu_monitor("Forward Pass", stop_event, results, thread)
         fwd_end_event.record()
@@ -190,7 +203,7 @@ class TPExecutor(Executor):
         logging.info(f"Task to running, need to load adapters: {task.adapter_name()}")
         task.switch_device(self.device_)
         for adapter_model in task.adapter_model():
-            self.model_.load_adapter(adapter_model)
+            self.model_.load_adapter(task.adapter_name()[0], adapter_model)
 
     def __task_to_ready_hook(self, task: Task):
         logging.info(f"Base model offload adapters: {task.adapter_name()}")
