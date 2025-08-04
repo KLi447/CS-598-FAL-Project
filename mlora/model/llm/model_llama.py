@@ -142,6 +142,7 @@ class LlamaModel(LLMModel):
     seq_module_: torch.nn.Sequential
 
     def __init__(self, args: LLMModelArgs):
+        super().__init__()
         self.name_or_path_: str = args.name_or_path_
         # sequential model
 

@@ -1,4 +1,3 @@
-from abc import ABCMeta, abstractmethod
 from collections import OrderedDict
 from typing import List, Optional
 
@@ -7,34 +6,36 @@ import torch
 from mlora.model.args import LinearInfo, ModelData
 from mlora.model.modules import AdapterModel
 
-
-class LLMModel(metaclass=ABCMeta):
+class LLMModel(torch.nn.Module):
     name_or_path_: str
     device_: str
     vocab_size_: int
     n_heads_: int
     dim_: int
 
-    @abstractmethod
-    def forward(self, input: ModelData): ...
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, input: ModelData):
+        raise NotImplementedError
 
     @staticmethod
-    @abstractmethod
     def from_pretrained(
         path: str,
         device: str,
         precision: str,
         partial_model_to_device: Optional[List[int]] = None,
-    ) -> "LLMModel": ...
+    ) -> "LLMModel":
+        raise NotImplementedError
 
-    @abstractmethod
-    def load_adapter(self, adapter_model: AdapterModel): ...
+    def load_adapter(self, adapter_model: AdapterModel):
+        raise NotImplementedError
 
-    @abstractmethod
-    def offload_adapter(self, adapter_name: str): ...
+    def offload_adapter(self, adapter_name: str):
+        raise NotImplementedError
 
-    @abstractmethod
-    def linears_info(self) -> OrderedDict[str, LinearInfo]: ...
+    def linears_info(self) -> OrderedDict[str, LinearInfo]:
+        raise NotImplementedError
 
-    @abstractmethod
-    def sequential(self) -> torch.nn.Sequential: ...
+    def sequential(self) -> torch.nn.Sequential:
+        raise NotImplementedError
