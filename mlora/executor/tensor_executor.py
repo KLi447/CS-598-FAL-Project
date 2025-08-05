@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
+from torch.optim import AdamW
 
 from mlora.config import MLoRAConfig
 from mlora.config.task import TaskConfig
@@ -35,6 +36,7 @@ class TPExecutor(Executor):
     mlora_config: DictConfig
 
     dispatcher_: TensorParallelDispatcher
+    optimizer_: torch.optim.Optimizer
 
     def __init__(
         self,
@@ -54,6 +56,9 @@ class TPExecutor(Executor):
         self.world_size_ = world_size
 
         self.model_.to(self.device_)
+
+        # Create an optimizer for the model parameters
+        self.optimizer_ = AdamW(self.model_.parameters(), lr=1e-5)
 
         self.dispatcher_ = DISPATCHER_CLASS["tensor"](config.dispatcher_, {})
 
@@ -134,13 +139,8 @@ class TPExecutor(Executor):
             self.process_batch(train_data)
 
     def process_batch(self, train_data: MLoRAData):
-        tokens = torch.tensor(
-            train_data.batch_tokens_,
-            dtype=torch.long,
-            device=self.device_,
-        )
-        labels = torch.tensor(train_data.batch_tokens_, dtype=torch.long)
-        masks = torch.tensor(train_data.batch_mask_)
+        labels = torch.tensor(train_data.batch_tokens_, dtype=torch.long, device=self.device_)
+        masks = torch.tensor(train_data.batch_mask_, device=self.device_)
 
         fwd_start_event = torch.cuda.Event(enable_timing=True)
         fwd_end_event = torch.cuda.Event(enable_timing=True)
@@ -169,6 +169,8 @@ class TPExecutor(Executor):
             bwd_start_event.record()
             stop_event, results, thread = self._start_gpu_monitor()
 
+            self.optimizer_.zero_grad()
+            
             total_loss.backward()
 
             self._stop_gpu_monitor("Backward Pass", stop_event, results, thread)
@@ -177,10 +179,8 @@ class TPExecutor(Executor):
             bwd_latency_ms = bwd_start_event.elapsed_time(bwd_end_event)
             logging.info(f"    Backward Pass Latency (Rank {self.rank_}): {bwd_latency_ms:.4f} ms")
 
-            for param in self.model_.parameters():
-                if param.grad is not None:
-                    dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
-                    param.grad /= self.world_size_
+            self.optimizer_.step()
+
         else:
             logging.warning("Batch produced no loss value.")
 
@@ -202,6 +202,8 @@ class TPExecutor(Executor):
     def __task_to_running_hook(self, task: Task):
         logging.info(f"Task to running, need to load adapters: {task.adapter_name()}")
         task.switch_device(self.device_)
+        self.optimizer_ = AdamW(self.model_.parameters(), lr=1e-5)
+        
         for adapter_model in task.adapter_model():
             self.model_.load_adapter(task.adapter_name()[0], adapter_model)
 

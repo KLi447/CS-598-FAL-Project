@@ -7,7 +7,7 @@ import torch
 import torch.distributed as dist
 from torch.nn import Module, ModuleList, Parameter, Sequential
 from torch.nn import functional as F
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM, BitsAndBytesConfig
 
 from mlora.model.args import LinearInfo, LLMModelArgs, ModelData
 from mlora.model.modules import AdapterModel
@@ -26,13 +26,15 @@ class _CopyToTensorParallelRegion(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        dist.all_reduce(grad_output)
+        if dist.is_initialized():
+            dist.all_reduce(grad_output)
         return grad_output
 
 class _ReduceFromTensorParallelRegion(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_):
-        dist.all_reduce(input_)
+        if dist.is_initialized():
+            dist.all_reduce(input_)
         return input_
 
     @staticmethod
@@ -109,8 +111,9 @@ class TensorParallelLoRALayer(Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         lora_output = (x @ self.lora_a.T) @ self.lora_b.T * self.scaling
         if self.is_row_parallel:
-            dist.all_reduce(lora_output)
-        return lora_output
+            return _ReduceFromTensorParallelRegion.apply(lora_output)
+        else:
+            return lora_output
 
 class TensorParallelAttention(torch.nn.Module):
     def __init__(self, args: LLMModelArgs):
@@ -121,7 +124,7 @@ class TensorParallelAttention(torch.nn.Module):
         world_size = get_tensor_parallel_world_size()
 
         self.n_heads_per_partition = self.n_heads // world_size
-        self.n_kv_heads_per_partition = self.n_kv_heads // world_size
+        self.n_kv_heads_per_partition = self.n_kv_heads // world_size if self.n_kv_heads > 0 else 0
 
         self.q_proj = ColumnParallelLinear(args.dim_, args.dim_, bias=False, device=args.device_, dtype=args.dtype_)
         self.k_proj = ColumnParallelLinear(args.dim_, self.n_kv_heads * self.head_dim, bias=False, device=args.device_, dtype=args.dtype_)
@@ -135,10 +138,11 @@ class TensorParallelAttention(torch.nn.Module):
         k = self.k_proj(x).view(batch_size, seq_len, self.n_kv_heads_per_partition, self.head_dim).transpose(1, 2)
         v = self.v_proj(x).view(batch_size, seq_len, self.n_kv_heads_per_partition, self.head_dim).transpose(1, 2)
 
-        num_query_groups = self.n_heads_per_partition // self.n_kv_heads_per_partition
-        if num_query_groups > 1:
-            k = k.repeat_interleave(num_query_groups, dim=1)
-            v = v.repeat_interleave(num_query_groups, dim=1)
+        if self.n_kv_heads_per_partition > 0:
+            num_query_groups = self.n_heads_per_partition // self.n_kv_heads_per_partition
+            if num_query_groups > 1:
+                k = k.repeat_interleave(num_query_groups, dim=1)
+                v = v.repeat_interleave(num_query_groups, dim=1)
 
         scores = torch.matmul(q, k.transpose(2, 3)) / (self.head_dim ** 0.5)
         if mask is not None:
@@ -175,15 +179,15 @@ class TensorParallelDecoderLayer(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor, data: ModelData):
         residual = x
-        x = self.input_layernorm(x)
-        x = self.self_attn(x, mask, data)
-        x = residual + x
-        
+        hidden_states = self.input_layernorm(x)
+        hidden_states = self.self_attn(hidden_states, mask, data)
+        x = residual + hidden_states
+
         residual = x
-        x = self.post_attention_layernorm(x)
-        x = self.mlp(x)
-        x = residual + x
-        
+        hidden_states = self.post_attention_layernorm(x)
+        hidden_states = self.mlp(hidden_states)
+        x = residual + hidden_states
+
         return x
 
     def linears_info(self) -> OrderedDict[str, LinearInfo]:
@@ -227,50 +231,78 @@ class TensorParallelDecoderLayer(torch.nn.Module):
 
             lora_a_full = lora_config.lora_a_
             lora_b_full = lora_config.lora_b_
-            
+
+            def hook(module, input, output, lora_layer):
+                return output + lora_layer(input[0])
+
             if isinstance(base_layer, ColumnParallelLinear):
                 in_dim = base_layer.weight.shape[1]
                 out_dim = base_layer.out_features_per_partition * world_size
+                
+                if lora_a_full.shape[1] != in_dim:
+                    raise ValueError(f"LoRA A matrix for {full_layer_name} has incorrect in_features: expected {in_dim}, got {lora_a_full.shape[1]}")
+                if lora_b_full.shape[0] != out_dim:
+                    raise ValueError(f"LoRA B matrix for {full_layer_name} has incorrect out_features: expected {out_dim}, got {lora_b_full.shape[0]}")
+
+                lora_a_sharded = lora_a_full
+                lora_b_sharded = lora_b_full.chunk(world_size, dim=0)[rank]
+                
+                lora_layer = TensorParallelLoRALayer(
+                    base_layer, r=lora_config.r_, scaling=lora_config.scaling_,
+                    lora_a=lora_a_sharded.to(base_layer.weight.device),
+                    lora_b=lora_b_sharded.to(base_layer.weight.device)
+                )
+
+                hook_handle = base_layer.register_forward_hook(
+                    lambda m, i, o, l=lora_layer: hook(m, i, o, l)
+                )
+                self.adapters[adapter_name].append({"name": full_layer_name, "hook": hook_handle})
+
             elif isinstance(base_layer, RowParallelLinear):
                 in_dim = base_layer.in_features_per_partition * world_size
                 out_dim = base_layer.weight.shape[0]
-            else:
-                continue
-            
-        if lora_a_full.shape[1] != in_dim:
-            raise ValueError(f"LoRA A matrix for {full_layer_name} has incorrect in_features: "
-                             f"expected {in_dim}, got {lora_a_full.shape[1]}")
-        if lora_b_full.shape[0] != out_dim:
-            raise ValueError(f"LoRA B matrix for {full_layer_name} has incorrect out_features: "
-                             f"expected {out_dim}, got {lora_b_full.shape[0]}")
-            
-            lora_layer = TensorParallelLoRALayer(
-                base_layer,
-                r=lora_config.r_,
-                scaling=lora_config.scaling_,
-                lora_a=lora_a_sharded.to(base_layer.weight.device),
-                lora_b=lora_b_sharded.to(base_layer.weight.device)
-            )
-            
-            def hook(module, input, output):
-                return output + lora_layer(input[0])
-            
-            hook_handle = base_layer.register_forward_hook(hook)
-            self.adapters[adapter_name].append({"name": full_layer_name, "hook": hook_handle})
+
+                if lora_a_full.shape[1] != in_dim:
+                    raise ValueError(f"LoRA A matrix for {full_layer_name} has incorrect in_features: expected {in_dim}, got {lora_a_full.shape[1]}")
+                if lora_b_full.shape[0] != out_dim:
+                    raise ValueError(f"LoRA B matrix for {full_layer_name} has incorrect out_features: expected {out_dim}, got {lora_b_full.shape[0]}")
+
+                lora_a_sharded = lora_a_full.chunk(world_size, dim=1)[rank]
+                lora_b_sharded = lora_b_full
+
+                lora_layer = TensorParallelLoRALayer(
+                    base_layer, r=lora_config.r_, scaling=lora_config.scaling_,
+                    lora_a=lora_a_sharded.to(base_layer.weight.device),
+                    lora_b=lora_b_sharded.to(base_layer.weight.device)
+                )
+
+                hook_handle = base_layer.register_forward_hook(
+                    lambda m, i, o, l=lora_layer: hook(m, i, o, l)
+                )
+                self.adapters[adapter_name].append({"name": full_layer_name, "hook": hook_handle})
 
     def offload_adapter(self, adapter_name: str):
+        """
+        Removes an adapter by detaching its forward hooks.
+        """
         if adapter_name not in self.adapters: return
         for adapter_info in self.adapters[adapter_name]:
             adapter_info["hook"].remove()
         del self.adapters[adapter_name]
 
 def precompute_mask(input_tokens, n_heads, device, dtype):
+    """
+    Creates a causal attention mask.
+    """
     batch_size, seq_len = input_tokens.shape
-    mask = torch.full((batch_size, 1, seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
+    mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
     mask = torch.triu(mask, diagonal=1)
     return mask
 
 class LlamaModel_TP(LLMModel):
+    """
+    The main tensor-parallel Llama model class.
+    """
     def __init__(self, args: LLMModelArgs, config):
         super().__init__()
         
@@ -302,6 +334,9 @@ class LlamaModel_TP(LLMModel):
     @override
     @staticmethod
     def from_pretrained(path: str, device: str, precision: str, **kwargs) -> "LlamaModel_TP":
+        """
+        Loads a model from a pretrained checkpoint and shards it for tensor parallelism.
+        """
         rank = get_tensor_parallel_rank()
         world_size = get_tensor_parallel_world_size()
 
@@ -338,6 +373,7 @@ class LlamaModel_TP(LLMModel):
         
         llama_args.dtype_ = additional_load_args["torch_dtype"]
 
+        # Initialize the model on the meta device to avoid allocating memory
         with torch.device('meta'):
             model = LlamaModel_TP(llama_args, config)
 
@@ -351,17 +387,25 @@ class LlamaModel_TP(LLMModel):
         if world_size > 1:
             dist.barrier()
 
-        for name, param in state_dict.items():
-            module_path, _, param_name = name.rpartition('.')
+        # Copy weights from the loaded state_dict, sharding them as necessary
+        for name, param in model.named_parameters():
+            if name not in state_dict:
+                logging.warning(f"Weight {name} not found in checkpoint")
+                continue
+            
+            source_tensor = state_dict[name]
             
             if "q_proj" in name or "k_proj" in name or "v_proj" in name or "gate_proj" in name or "up_proj" in name:
-                sharded_param = param.chunk(world_size, dim=0)[rank]
-                model.get_submodule(module_path).weight.data.copy_(sharded_param)
+                # Shard column-parallel layers along dimension 0
+                sharded_tensor = source_tensor.chunk(world_size, dim=0)[rank]
+                param.data.copy_(sharded_tensor)
             elif "o_proj" in name or "down_proj" in name:
-                sharded_param = param.chunk(world_size, dim=1)[rank]
-                model.get_submodule(module_path).weight.data.copy_(sharded_param)
-            else: # Replicated weights
-                model.get_submodule(module_path).get_parameter(param_name).data.copy_(param)
+                # Shard row-parallel layers along dimension 1
+                sharded_tensor = source_tensor.chunk(world_size, dim=1)[rank]
+                param.data.copy_(sharded_tensor)
+            else: 
+                # Replicated weights (embeddings, layernorms, lm_head)
+                param.data.copy_(source_tensor)
 
         logging.info(f"Rank {rank} successfully loaded its shard of the model to {device}.")
         del state_dict
