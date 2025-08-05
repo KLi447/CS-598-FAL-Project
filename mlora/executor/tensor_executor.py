@@ -46,6 +46,7 @@ class TPExecutor(Executor):
         device: str,
         rank: int,
         world_size: int,
+        recompute: bool = True,
     ) -> None:
         self.model_ = model
         self.tokenizer_ = tokenizer
@@ -54,6 +55,7 @@ class TPExecutor(Executor):
         self.device_ = device
         self.rank_ = rank
         self.world_size_ = world_size
+        self.recompute_ = recompute
 
         self.model_.to(self.device_)
 
@@ -147,7 +149,9 @@ class TPExecutor(Executor):
         fwd_start_event.record()
         stop_event, results, thread = self._start_gpu_monitor()
 
-        output = self.model_(train_data.model_data())
+        model_data = train_data.model_data()
+        model_data.enable_checkpoint_ = self.recompute_
+        output = self.model_(model_data)
 
         self._stop_gpu_monitor("Forward Pass", stop_event, results, thread)
         fwd_end_event.record()

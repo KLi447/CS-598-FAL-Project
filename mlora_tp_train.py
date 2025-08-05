@@ -67,7 +67,7 @@ if __name__ == "__main__":
         config = mlora.config.MLoRAConfig(args.config)
 
         executor = mlora.executor.TPExecutor(
-            model, tokenizer, config, args.device, args.rank, args.nodes
+            model, tokenizer, config, args.device, args.rank, args.nodes, args.recompute
         )
 
         for item in config.tasks_:

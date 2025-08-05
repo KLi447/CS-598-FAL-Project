@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, override
 
 import torch
 import torch.distributed as dist
+from mlora.model.checkpoint import CheckpointRecomputeFunction
 from torch.nn import Module, ModuleList, Parameter, Sequential
 from torch.nn import functional as F
 from transformers import AutoConfig, AutoModelForCausalLM, BitsAndBytesConfig
@@ -42,17 +43,18 @@ class _ReduceFromTensorParallelRegion(torch.autograd.Function):
         return grad_output
 
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, dtype=torch.float32):
         super().__init__()
         self.eps = eps
-        self.weight = Parameter(torch.ones(dim))
+        self.weight = Parameter(torch.ones(dim, dtype=dtype))
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x.to(torch.float32) * torch.rsqrt(x.to(torch.float32).pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
-        output = self._norm(x.float()).type_as(x)
-        return output * self.weight
+        input_dtype = x.dtype
+        output = self._norm(x)
+        return (output * self.weight.to(torch.float32)).to(input_dtype)
 
 class ColumnParallelLinear(torch.nn.Module):
     def __init__(self, in_features, out_features, bias=False, device=None, dtype=None):
@@ -173,8 +175,8 @@ class TensorParallelDecoderLayer(torch.nn.Module):
         super().__init__()
         self.self_attn = TensorParallelAttention(args)
         self.mlp = TensorParallelMLP(args, config)
-        self.input_layernorm = RMSNorm(args.dim_, eps=args.norm_eps_)
-        self.post_attention_layernorm = RMSNorm(args.dim_, eps=args.norm_eps_)
+        self.input_layernorm = RMSNorm(args.dim_, eps=args.norm_eps_, dtype=args.dtype_)
+        self.post_attention_layernorm = RMSNorm(args.dim_, eps=args.norm_eps_, dtype=args.dtype_)
         self.adapters: Dict[str, List] = {}
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor, data: ModelData):
@@ -249,8 +251,8 @@ class TensorParallelDecoderLayer(torch.nn.Module):
                 
                 lora_layer = TensorParallelLoRALayer(
                     base_layer, r=lora_config.r_, scaling=lora_config.scaling_,
-                    lora_a=lora_a_sharded.to(base_layer.weight.device),
-                    lora_b=lora_b_sharded.to(base_layer.weight.device)
+                    lora_a=lora_a_sharded.to(device=base_layer.weight.device, dtype=base_layer.weight.dtype),
+                    lora_b=lora_b_sharded.to(device=base_layer.weight.device, dtype=base_layer.weight.dtype)
                 )
 
                 hook_handle = base_layer.register_forward_hook(
@@ -272,8 +274,8 @@ class TensorParallelDecoderLayer(torch.nn.Module):
 
                 lora_layer = TensorParallelLoRALayer(
                     base_layer, r=lora_config.r_, scaling=lora_config.scaling_,
-                    lora_a=lora_a_sharded.to(base_layer.weight.device),
-                    lora_b=lora_b_sharded.to(base_layer.weight.device)
+                    lora_a=lora_a_sharded.to(device=base_layer.weight.device, dtype=base_layer.weight.dtype),
+                    lora_b=lora_b_sharded.to(device=base_layer.weight.device, dtype=base_layer.weight.dtype)
                 )
 
                 hook_handle = base_layer.register_forward_hook(
@@ -304,10 +306,10 @@ class LlamaModel_TP(LLMModel):
         self.device_ = args.device_
         self.n_heads_ = args.n_heads_
 
-        self.embed_tokens = torch.nn.Embedding(args.vocab_size_, args.dim_, self.pad_token_id_)
+        self.embed_tokens = torch.nn.Embedding(args.vocab_size_, args.dim_, self.pad_token_id_, dtype=args.dtype_)
         self.layers = ModuleList([TensorParallelDecoderLayer(args, config) for _ in range(args.n_layers_)])
-        self.norm = RMSNorm(args.dim_, eps=args.norm_eps_)
-        self.lm_head = torch.nn.Linear(args.dim_, args.vocab_size_, bias=False)
+        self.norm = RMSNorm(args.dim_, eps=args.norm_eps_, dtype=args.dtype_)
+        self.lm_head = torch.nn.Linear(args.dim_, args.vocab_size_, bias=False, dtype=args.dtype_)
 
     @override
     def forward(self, input: ModelData) -> torch.Tensor:
@@ -315,8 +317,12 @@ class LlamaModel_TP(LLMModel):
         mask = precompute_mask(tokens, self.n_heads_, self.device_, self.args.dtype_)
         
         hidden_states = self.embed_tokens(tokens)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, mask, input)
+        if input.enable_checkpoint_:
+            for layer in self.layers:
+                hidden_states = CheckpointRecomputeFunction(layer, hidden_states, mask, input)
+        else:
+            for layer in self.layers:
+                hidden_states = layer(hidden_states, mask, input)
         hidden_states = self.norm(hidden_states)
         logits = self.lm_head(hidden_states)
         
