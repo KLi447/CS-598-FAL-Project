@@ -282,27 +282,18 @@ class TensorParallelDecoderLayer(torch.nn.Module):
                 self.adapters[adapter_name].append({"name": full_layer_name, "hook": hook_handle})
 
     def offload_adapter(self, adapter_name: str):
-        """
-        Removes an adapter by detaching its forward hooks.
-        """
         if adapter_name not in self.adapters: return
         for adapter_info in self.adapters[adapter_name]:
             adapter_info["hook"].remove()
         del self.adapters[adapter_name]
 
 def precompute_mask(input_tokens, n_heads, device, dtype):
-    """
-    Creates a causal attention mask.
-    """
     batch_size, seq_len = input_tokens.shape
     mask = torch.full((1, 1, seq_len, seq_len), float("-inf"), device=device, dtype=dtype)
     mask = torch.triu(mask, diagonal=1)
     return mask
 
 class LlamaModel_TP(LLMModel):
-    """
-    The main tensor-parallel Llama model class.
-    """
     def __init__(self, args: LLMModelArgs, config):
         super().__init__()
         
@@ -334,9 +325,6 @@ class LlamaModel_TP(LLMModel):
     @override
     @staticmethod
     def from_pretrained(path: str, device: str, precision: str, **kwargs) -> "LlamaModel_TP":
-        """
-        Loads a model from a pretrained checkpoint and shards it for tensor parallelism.
-        """
         rank = get_tensor_parallel_rank()
         world_size = get_tensor_parallel_world_size()
 
@@ -373,7 +361,6 @@ class LlamaModel_TP(LLMModel):
         
         llama_args.dtype_ = additional_load_args["torch_dtype"]
 
-        # Initialize the model on the meta device to avoid allocating memory
         with torch.device('meta'):
             model = LlamaModel_TP(llama_args, config)
 
@@ -387,7 +374,6 @@ class LlamaModel_TP(LLMModel):
         if world_size > 1:
             dist.barrier()
 
-        # Copy weights from the loaded state_dict, sharding them as necessary
         for name, param in model.named_parameters():
             if name not in state_dict:
                 logging.warning(f"Weight {name} not found in checkpoint")
@@ -396,15 +382,12 @@ class LlamaModel_TP(LLMModel):
             source_tensor = state_dict[name]
             
             if "q_proj" in name or "k_proj" in name or "v_proj" in name or "gate_proj" in name or "up_proj" in name:
-                # Shard column-parallel layers along dimension 0
                 sharded_tensor = source_tensor.chunk(world_size, dim=0)[rank]
                 param.data.copy_(sharded_tensor)
             elif "o_proj" in name or "down_proj" in name:
-                # Shard row-parallel layers along dimension 1
                 sharded_tensor = source_tensor.chunk(world_size, dim=1)[rank]
                 param.data.copy_(sharded_tensor)
             else: 
-                # Replicated weights (embeddings, layernorms, lm_head)
                 param.data.copy_(source_tensor)
 
         logging.info(f"Rank {rank} successfully loaded its shard of the model to {device}.")
