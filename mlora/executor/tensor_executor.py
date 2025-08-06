@@ -156,19 +156,19 @@ class TPExecutor(Executor):
 
         fwd_start_event = torch.cuda.Event(enable_timing=True)
         fwd_end_event = torch.cuda.Event(enable_timing=True)
-        fwd_start_event.record()
-        stop_event, results, thread = self._start_gpu_monitor()
-
         model_data = train_data.model_data()
         model_data.enable_checkpoint_ = self.recompute_
         
+        fwd_start_event.record()
+        stop_event, results, thread = self._start_gpu_monitor()
+        
         output = self.model_(model_data)
-
-        fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
-        logging.info(f"Forward pass peak memory: {fwd_peak_memory_mb:.2f} MB")
 
         self._stop_gpu_monitor("Forward Pass", stop_event, results, thread)
         fwd_end_event.record()
+        fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+        logging.info(f"Forward pass peak memory: {fwd_peak_memory_mb:.2f} MB")
+        
         torch.cuda.synchronize()
         fwd_latency_ms = fwd_start_event.elapsed_time(fwd_end_event)
         logging.info(f"    Forward Pass Latency (Rank {self.rank_}): {fwd_latency_ms:.4f} ms")
@@ -184,18 +184,21 @@ class TPExecutor(Executor):
             logging.info(f"Total Batch Loss: {total_loss.item()}")
             bwd_start_event = torch.cuda.Event(enable_timing=True)
             bwd_end_event = torch.cuda.Event(enable_timing=True)
+
+            torch.cuda.reset_peak_memory_stats(self.device_)
+            self.optimizer_.zero_grad()
+
             bwd_start_event.record()
             stop_event, results, thread = self._start_gpu_monitor()
-            torch.cuda.reset_peak_memory_stats(self.device_)
-
-            self.optimizer_.zero_grad()
 
             total_loss.backward()
 
-            bwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
-            logging.info(f"Backward pass peak memory: {bwd_peak_memory_mb:.2f} MB")
             self._stop_gpu_monitor("Backward Pass", stop_event, results, thread)
             bwd_end_event.record()
+
+            bwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+            logging.info(f"Backward pass peak memory: {bwd_peak_memory_mb:.2f} MB")
+
             torch.cuda.synchronize()
             bwd_latency_ms = bwd_start_event.elapsed_time(bwd_end_event)
             logging.info(f"    Backward Pass Latency (Rank {self.rank_}): {bwd_latency_ms:.4f} ms")
