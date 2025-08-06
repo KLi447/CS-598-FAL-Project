@@ -66,6 +66,18 @@ if __name__ == "__main__":
         tokenizer, model = mlora.model.load_model(args)
         config = mlora.config.MLoRAConfig(args.config)
 
+        tasks_to_run = []
+
+        if args.rank == 0:
+            tasks_to_run = config.tasks_
+            logging.info(f"Rank 0: Loaded {len(tasks_to_run)} tasks from config.")
+
+        if is_distributed:
+            object_list = [tasks_to_run]
+            dist.broadcast_object_list(object_list, src=0)
+            tasks_to_run = object_list[0]
+            logging.info(f"Rank {args.rank}: Received {len(tasks_to_run)} tasks from Rank 0.")
+
         executor = mlora.executor.TPExecutor(
             model, tokenizer, config, args.device, args.rank, args.nodes, args.recompute
         )
