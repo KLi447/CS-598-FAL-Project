@@ -84,11 +84,17 @@ class Task:
         cache_path: str = self.shuffle_data_cache_path_
         # If exist cache files, then delete them.
         if os.path.exists(cache_path):
-            os.remove(cache_path)
+            try:
+                os.remove(cache_path)
+            except OSError:
+                pass
         # If the cache folder is empty, delete it.
         dir, _ = os.path.split(cache_path)
         if os.path.exists(dir) and len(os.listdir(dir)) == 0:
-            os.rmdir(dir)
+            try:
+                os.rmdir(dir)
+            except OSError:
+                pass
 
     def _shuffle_data(self, data):
         # If data preprocess_type is shuffle, create a cache folder,
@@ -103,7 +109,7 @@ class Task:
         self._del_cache_file()
         cache_dir, _ = os.path.split(self.shuffle_data_cache_path_)
         if not os.path.exists(cache_dir):
-            os.makedirs(cache_dir)
+            os.makedirs(cache_dir, exist_ok=True)
 
         # If exist checkpoint, copy the shuffle_data in checkpoint to cache path.
         if self.recover_folder_ is not None:

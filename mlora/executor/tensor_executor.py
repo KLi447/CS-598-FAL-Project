@@ -57,10 +57,20 @@ class TPExecutor(Executor):
         self.world_size_ = world_size
         self.recompute_ = recompute
 
+        self.loaded_adapters_ = set()
+
         self.model_.to(self.device_)
 
-        # Create an optimizer for the model parameters
-        self.optimizer_ = AdamW(self.model_.parameters(), lr=1e-5)
+        for param in model.parameters():
+            param.requires_grad = False
+
+        trainable_params=[]
+        if hasattr(self.model_, 'lm_head'):
+            for param in self.model_.lm_head.parameters():
+                param.requires_grad = True
+                trainable_params.append(param)
+
+        self.optimizer_ = AdamW(trainable_params, lr=1e-5)
 
         self.dispatcher_ = DISPATCHER_CLASS["tensor"](config.dispatcher_, {})
 
@@ -82,7 +92,6 @@ class TPExecutor(Executor):
             while not stop_event.is_set():
                 util = pynvml.nvmlDeviceGetUtilizationRates(handle)
                 results.append(util.gpu)
-                time.sleep(0.01)  # Poll every 10ms
         except Exception as e:
             logging.warning(f"GPU poll thread failed: {e}")
         finally:
@@ -141,6 +150,7 @@ class TPExecutor(Executor):
             self.process_batch(train_data)
 
     def process_batch(self, train_data: MLoRAData):
+        torch.cuda.reset_peak_memory_stats(self.device_)
         labels = torch.tensor(train_data.batch_tokens_, dtype=torch.long, device=self.device_)
         masks = torch.tensor(train_data.batch_mask_, device=self.device_)
 
@@ -151,7 +161,11 @@ class TPExecutor(Executor):
 
         model_data = train_data.model_data()
         model_data.enable_checkpoint_ = self.recompute_
+        
         output = self.model_(model_data)
+
+        fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+        logging.info(f"Forward pass peak memory: {fwd_peak_memory_mb:.2f} MB")
 
         self._stop_gpu_monitor("Forward Pass", stop_event, results, thread)
         fwd_end_event.record()
@@ -172,11 +186,14 @@ class TPExecutor(Executor):
             bwd_end_event = torch.cuda.Event(enable_timing=True)
             bwd_start_event.record()
             stop_event, results, thread = self._start_gpu_monitor()
+            torch.cuda.reset_peak_memory_stats(self.device_)
 
             self.optimizer_.zero_grad()
-            
+
             total_loss.backward()
 
+            bwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+            logging.info(f"Backward pass peak memory: {bwd_peak_memory_mb:.2f} MB")
             self._stop_gpu_monitor("Backward Pass", stop_event, results, thread)
             bwd_end_event.record()
             torch.cuda.synchronize()
@@ -184,7 +201,6 @@ class TPExecutor(Executor):
             logging.info(f"    Backward Pass Latency (Rank {self.rank_}): {bwd_latency_ms:.4f} ms")
 
             self.optimizer_.step()
-
         else:
             logging.warning("Batch produced no loss value.")
 
@@ -206,16 +222,30 @@ class TPExecutor(Executor):
     def __task_to_running_hook(self, task: Task):
         logging.info(f"Task to running, need to load adapters: {task.adapter_name()}")
         task.switch_device(self.device_)
-        self.optimizer_ = AdamW(self.model_.parameters(), lr=1e-5)
-        
+
+        if task.config_.name_ in self.loaded_adapters_:
+            return
+
+        adapter_params_to_add = []
         for adapter_model in task.adapter_model():
             self.model_.load_adapter(task.adapter_name()[0], adapter_model)
+            for module in adapter_model.values():
+                if isinstance(module, torch.nn.Module):
+                    adapter_params_to_add.extend(list(module.parameters()))
+
+        if adapter_params_to_add:
+            self.optimizer_.add_param_group({
+                "params": adapter_params_to_add,
+                "lr": 1e-5 #FIXME unhardcode
+            })
+            self.loaded_adapters_.add(task.config_.name_)
 
     def __task_to_ready_hook(self, task: Task):
         logging.info(f"Base model offload adapters: {task.adapter_name()}")
         task.switch_device("cpu")
         for adapter_name in task.adapter_name():
             self.model_.offload_adapter(adapter_name)
+        torch.cuda.empty_cache()
 
     def __task_to_done_hook(self, task: Task):
         logging.info(f"Finish and base model offload adapter - {task.adapter_name()}")
