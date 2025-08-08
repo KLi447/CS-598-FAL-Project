@@ -6,6 +6,7 @@ from typing import Any, Dict, List, OrderedDict, Tuple, cast
 from dataclasses import dataclass
 
 import torch
+import torch.profiler
 import torch.distributed as dist
 from torch.optim import AdamW
 
@@ -85,44 +86,6 @@ class TPExecutor(Executor):
         for hook, cb in hook_func.items():
             self.dispatcher_.register_hook(hook, cb)
 
-    def _poll_gpu_stats(self, stop_event: threading.Event, results: List[int]):
-        try:
-            pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(int(self.device_.split(":")[-1]))
-            while not stop_event.is_set():
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                results.append(util.gpu)
-        except Exception as e:
-            logging.warning(f"GPU poll thread failed: {e}")
-        finally:
-            pynvml.nvmlShutdown()
-
-    def _start_gpu_monitor(self) -> Tuple[threading.Event, List[int], threading.Thread]:
-        stop_event = threading.Event()
-        util_results = []
-        monitor_thread = threading.Thread(
-            target=self._poll_gpu_stats, args=(stop_event, util_results), daemon=True
-        )
-        monitor_thread.start()
-        return stop_event, util_results, monitor_thread
-
-    def _stop_gpu_monitor(
-        self,
-        context: str,
-        stop_event: threading.Event,
-        util_results: List[int],
-        monitor_thread: threading.Thread,
-    ):
-        stop_event.set()
-        monitor_thread.join()
-        if util_results:
-            avg_util = sum(util_results) / len(util_results)
-            max_util = max(util_results)
-            logging.info(
-                f"GPU UTIL @ {context} (Rank {self.rank_}): "
-                f"Avg: {avg_util:.2f}%, Max: {max_util}%"
-            )
-
     def calculate_costs(self):
         ##FIXME
         adapter_profiles = {}
@@ -141,13 +104,26 @@ class TPExecutor(Executor):
         self.dispatcher_.update_adapter_profiles(adapter_profiles)
 
     def execute(self) -> None:
-        while True:
-            train_data: MLoRAData | None = self.dispatcher_.data()
-            if train_data is None:
-                time.sleep(1 / 100000)
-                continue
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
 
-            self.process_batch(train_data)
+        with torch.profiler.profile(
+            activities=activities,
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/tp_executor'),
+            record_shapes=True,
+            with_stack=True
+        ) as prof:
+            while True:
+                train_data: MLoRAData | None = self.dispatcher_.data()
+                if train_data is None:
+                    time.sleep(1 / 100000)
+                    continue
+
+                self.process_batch(train_data)
+                prof.step()
 
     def process_batch(self, train_data: MLoRAData):
         torch.cuda.reset_peak_memory_stats(self.device_)
@@ -160,11 +136,9 @@ class TPExecutor(Executor):
         model_data.enable_checkpoint_ = self.recompute_
         
         fwd_start_event.record()
-        stop_event, results, thread = self._start_gpu_monitor()
         
         output = self.model_(model_data)
 
-        self._stop_gpu_monitor("Forward Pass", stop_event, results, thread)
         fwd_end_event.record()
         fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
         logging.info(f"Forward pass peak memory: {fwd_peak_memory_mb:.2f} MB")
@@ -189,11 +163,9 @@ class TPExecutor(Executor):
             self.optimizer_.zero_grad()
 
             bwd_start_event.record()
-            stop_event, results, thread = self._start_gpu_monitor()
 
             total_loss.backward()
 
-            self._stop_gpu_monitor("Backward Pass", stop_event, results, thread)
             bwd_end_event.record()
 
             bwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
