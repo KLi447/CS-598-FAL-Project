@@ -62,6 +62,28 @@ class TPExecutor(Executor):
 
         self.model_.to(self.device_)
 
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+        profiler_schedule = torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2)
+
+        self.fwd_profiler_ = torch.profiler.profile(
+            activities=activities,
+            schedule=profiler_schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/forward'),
+            record_shapes=True,
+            with_stack=True
+        )
+        
+        self.bwd_profiler_ = torch.profiler.profile(
+            activities=activities,
+            schedule=profiler_schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/backward'),
+            record_shapes=True,
+            with_stack=True
+        )
+
         for param in model.parameters():
             param.requires_grad = False
 
@@ -104,26 +126,13 @@ class TPExecutor(Executor):
         self.dispatcher_.update_adapter_profiles(adapter_profiles)
 
     def execute(self) -> None:
-        activities = [
-            torch.profiler.ProfilerActivity.CPU,
-            torch.profiler.ProfilerActivity.CUDA,
-        ]
+        while True:
+            train_data: MLoRAData | None = self.dispatcher_.data()
+            if train_data is None:
+                time.sleep(1 / 100000)
+                continue
 
-        with torch.profiler.profile(
-            activities=activities,
-            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler('./log/tp_executor'),
-            record_shapes=True,
-            with_stack=True
-        ) as prof:
-            while True:
-                train_data: MLoRAData | None = self.dispatcher_.data()
-                if train_data is None:
-                    time.sleep(1 / 100000)
-                    continue
-
-                self.process_batch(train_data)
-                prof.step()
+            self.process_batch(train_data)
 
     def process_batch(self, train_data: MLoRAData):
         torch.cuda.reset_peak_memory_stats(self.device_)
@@ -137,7 +146,10 @@ class TPExecutor(Executor):
         
         fwd_start_event.record()
         
+        self.fwd_profiler_.start()
         output = self.model_(model_data)
+        self.fwd_profiler_.step()
+        self.fwd_profiler_.stop()
 
         fwd_end_event.record()
         fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
@@ -164,7 +176,10 @@ class TPExecutor(Executor):
 
             bwd_start_event.record()
 
+            self.bwd_profiler_.start()
             total_loss.backward()
+            self.bwd_profiler_.step()
+            self.bwd_profiler_.stop()
 
             bwd_end_event.record()
 
