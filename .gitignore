@@ -172,3 +172,7 @@ adapters/*
 
 # macOS junk files
 .DS_Store
+
+# Logs
+logs/
+new_logs/

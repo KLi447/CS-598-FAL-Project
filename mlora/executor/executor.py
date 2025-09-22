@@ -34,6 +34,22 @@ class Executor:
         assert dispatcher_name in DISPATCHER_CLASS
         self.dispatcher_ = DISPATCHER_CLASS[dispatcher_name](config.dispatcher_)
 
+        activities = [
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+        profiler_schedule=torch.profiler.schedule(wait=2, warmup=1, active=7, repeat=1)
+
+        self.profiler_ = torch.profiler.profile(
+            activities=activities,
+            schedule=profiler_schedule,
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./new_logs/qwen_tiny'),
+            record_shapes=True,
+            with_stack=True
+        )
+
+        self.profiler_.start()
+
         hook_func = {
             "init": self.__task_init_hook,
             "running": self.__task_to_running_hook,
@@ -112,8 +128,23 @@ class Executor:
             batch_size = data.batch_size()
             token_len = data.token_len()
 
+            fwd_start_event = torch.cuda.Event(enable_timing=True)
+            fwd_end_event = torch.cuda.Event(enable_timing=True)
+
+            fwd_start_event.record()
+
             output = self.model_.forward(data.model_data())
+
+            fwd_end_event.record()
+
             labels = torch.tensor(data.batch_tokens_, dtype=torch.long)
+
+            fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.model_.device_) / (1024 * 1024)
+            logging.info(f"Forward pass peak memory: {fwd_peak_memory_mb:.2f} MB")
+            
+            torch.cuda.synchronize()
+            fwd_latency_ms = fwd_start_event.elapsed_time(fwd_end_event)
+            logging.info(f"    Forward Pass Latency: {fwd_latency_ms:.4f} ms")
 
             total_loss: Optional[torch.Tensor] = None
 
@@ -124,13 +155,26 @@ class Executor:
                 total_loss = loss if total_loss is None else total_loss + loss
 
             if total_loss is not None:
+                bwd_start_event = torch.cuda.Event(enable_timing=True)
+                bwd_end_event = torch.cuda.Event(enable_timing=True)
+
+                torch.cuda.reset_peak_memory_stats(self.model_.device_)
+                bwd_start_event.record()
+
                 total_loss.backward()
 
-            peak_memory = torch.cuda.max_memory_allocated(device=self.model_.device_)
-            utilization = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            logging.info(f"  Peak GPU Memory Usage: {peak_memory / 1024**3:.2f} GB")
-            logging.info(f"  GPU Compute Utilization: {utilization.gpu} %")
-            logging.info(f"  GPU Memory Utilization: {utilization.memory} %")
+                self.profiler_.step()
+
+                bwd_end_event.record()
+
+                bwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.model_.device_) / (1024 * 1024)
+                logging.info(f"Backward pass peak memory: {bwd_peak_memory_mb:.2f} MB")
+
+                torch.cuda.synchronize()
+                bwd_latency_ms = bwd_start_event.elapsed_time(bwd_end_event)
+                logging.info(f"    Backward Pass Latency: {bwd_latency_ms:.4f} ms")
+
+                logging.info(f"    Total Latency:{(fwd_latency_ms+bwd_latency_ms):.4f} ms")
 
             self.dispatcher_.step()
             mm_collect_step += 1

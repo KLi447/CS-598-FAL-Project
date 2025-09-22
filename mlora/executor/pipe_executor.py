@@ -28,7 +28,6 @@ from .task import Task
 from flops_profiler.profiler import get_model_profile
 from collections import namedtuple
 
-import pynvml
 
 class WorkerRole(Enum):
     HEAD = auto()
@@ -92,6 +91,20 @@ class PipeExecutor(Executor):
         self.__init_worker()
         self.__init_partition()
 
+        # activities = [
+        #     torch.profiler.ProfilerActivity.CPU,
+        #     torch.profiler.ProfilerActivity.CUDA,
+        # ]
+        # profiler_schedule=torch.profiler.schedule(wait=2, warmup=1, active=7, repeat=1)
+
+        # self.profiler_ = torch.profiler.profile(
+        #     activities=activities,
+        #     schedule=profiler_schedule,
+        #     on_trace_ready=torch.profiler.tensorboard_trace_handler('./new_logs/test'),
+        #     record_shapes=True,
+        #     with_stack=False
+        # )
+
         a = 0
         for partial_layer in self.partial_model_:
             logging.info(f"Layer {a}: {partial_layer.name()}")
@@ -123,45 +136,6 @@ class PipeExecutor(Executor):
 
         for hook, cb in hook_func.items():
             self.dispatcher_.register_hook(hook, cb)
-
-    def _poll_gpu_stats(self, stop_event: threading.Event, results: List[int]):
-        try:
-            pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(int(self.device_.split(":")[-1]))
-            while not stop_event.is_set():
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                results.append(util.gpu)
-                time.sleep(0.01)  # Poll every 10ms
-        except Exception as e:
-            logging.warning(f"GPU poll thread failed: {e}")
-        finally:
-            pynvml.nvmlShutdown()
-
-    def _start_gpu_monitor(self) -> Tuple[threading.Event, List[int], threading.Thread]:
-        stop_event = threading.Event()
-        util_results = []
-        monitor_thread = threading.Thread(
-            target=self._poll_gpu_stats, args=(stop_event, util_results), daemon=True
-        )
-        monitor_thread.start()
-        return stop_event, util_results, monitor_thread
-
-    def _stop_gpu_monitor(
-        self,
-        context: str,
-        stop_event: threading.Event,
-        util_results: List[int],
-        monitor_thread: threading.Thread,
-    ):
-        stop_event.set()
-        monitor_thread.join()
-        if util_results:
-            avg_util = sum(util_results) / len(util_results)
-            max_util = max(util_results)
-            logging.info(
-                f"GPU UTIL @ {context} (Rank {self.rank_}): "
-                f"Avg: {avg_util:.2f}%, Max: {max_util}%"
-            )
 
     def __init_worker(self):
         # init the different worker
@@ -329,6 +303,8 @@ class PipeExecutor(Executor):
 
         assert key in self.backward_cache_
 
+        torch.cuda.reset_peak_memory_stats(device=self.device_)
+
         phony: torch.Tensor = self.backward_cache_.pop(key)
         phony.grad_fn.grad_from_next_worker = message.tensor_data_  # type: ignore
 
@@ -340,11 +316,9 @@ class PipeExecutor(Executor):
             bwd_end_event = torch.cuda.Event(enable_timing=True)
 
             bwd_start_event.record()
-            stop_event, results, thread = self._start_gpu_monitor()
-            
+
             phony.backward()
 
-            self._stop_gpu_monitor("Backward Pass", stop_event, results, thread)
             bwd_end_event.record()
 
             model_data = message.model_data_
@@ -358,6 +332,9 @@ class PipeExecutor(Executor):
                 
                 torch.cuda.synchronize()
 
+                fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+                logging.info(f"Forward pass peak memory (Rank {self.rank_}): {fwd_peak_memory_mb:.2f} MB")
+
                 bwd_latency_ms = bwd_start_event.elapsed_time(bwd_end_event)
                 logging.info(
                     f"   Head Backward Pass Latency: {bwd_latency_ms:.4f} ms"
@@ -370,14 +347,17 @@ class PipeExecutor(Executor):
         else:
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
+
+            torch.cuda.reset_peak_memory_stats(device=self.device_)
             
             start_event.record()
-            stop_event, results, thread = self._start_gpu_monitor()
     
             phony.backward()
 
-            self._stop_gpu_monitor("Backward Pass", stop_event, results, thread)
             end_event.record()
+
+            bwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+            logging.info(f"Backward pass peak memory (Rank {self.rank_}): {bwd_peak_memory_mb:.2f} MB")
             
             torch.cuda.synchronize()
             latency_ms = start_event.elapsed_time(end_event)
@@ -406,6 +386,8 @@ class PipeExecutor(Executor):
             torch.tensor(1.0, requires_grad=True), self.transport_, message
         )
 
+        torch.cuda.reset_peak_memory_stats(device=self.device_)
+
         # we need to wait the default stream calcuate all tensor
         # and then send it, so we hook the pre stage fn to poll the stream
         data.grad_fn.pre_stage_fn = self.default_stream_.poll  # type: ignore
@@ -415,12 +397,13 @@ class PipeExecutor(Executor):
         end_event = torch.cuda.Event(enable_timing=True)
         
         start_event.record()
-        stop_event, results, thread = self._start_gpu_monitor()
         
         data = self.__forward(data, message.model_data_)
 
-        self._stop_gpu_monitor("Mid/Tail Forward Pass", stop_event, results, thread)
         end_event.record()
+
+        fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+        logging.info(f"Forward pass peak memory (Rank{self.rank_}): {fwd_peak_memory_mb:.2f} MB")
         
         torch.cuda.synchronize() # Wait for the forward pass to complete
         latency_ms = start_event.elapsed_time(end_event)
@@ -510,12 +493,10 @@ class PipeExecutor(Executor):
         end_event = torch.cuda.Event(enable_timing=True)
 
         start_event.record()
-        stop_event, results, thread = self._start_gpu_monitor()
         self.latency_events_[train_data.model_data().random_id_] = start_event
 
         hidden_data = self.__forward(tensor_data, train_data.model_data())
 
-        self._stop_gpu_monitor("Mid/Tail Forward Pass", stop_event, results, thread)
         end_event.record()
         torch.cuda.synchronize()
         latency_ms = start_event.elapsed_time(end_event)
@@ -596,24 +577,24 @@ class PipeExecutor(Executor):
         if self.role_ != WorkerRole.TAIL:
             self.__send_comm({"comm": "task_running", "data": task.task_name()})
 
-        task.switch_device(self.device_)
-        for adapter_model in task.adapter_model():
-            for partial_layer in self.partial_model_:
-                if partial_layer.name() != "Decoder":
-                    continue
-                partial_layer.wrapper_module_.load_adapter(adapter_model)
+        # task.switch_device(self.device_)
+        # for adapter_model in task.adapter_model():
+        #     for partial_layer in self.partial_model_:
+        #         if partial_layer.name() != "Decoder":
+        #             continue
+        #         partial_layer.wrapper_module_.load_adapter(adapter_model)
 
     def __task_to_ready_hook(self, task: Task):
         logging.info(f"Base model offload adapters: {task.adapter_name()}")
         if self.role_ != WorkerRole.TAIL:
             self.__send_comm({"comm": "task_ready", "data": task.task_name()})
 
-        task.switch_device("cpu")
-        for adapter_name in task.adapter_name():
-            for partial_layer in self.partial_model_:
-                if partial_layer.name() != "Decoder":
-                    continue
-                partial_layer.wrapper_module_.offload_adapter(adapter_name)
+        # task.switch_device("cpu")
+        # for adapter_name in task.adapter_name():
+        #     for partial_layer in self.partial_model_:
+        #         if partial_layer.name() != "Decoder":
+        #             continue
+        #         partial_layer.wrapper_module_.offload_adapter(adapter_name)
 
     def __task_to_done_hook(self, task: Task):
         logging.info(f"Finish and base model offload adapter - {task.adapter_name()}")
