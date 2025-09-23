@@ -2,8 +2,10 @@ import logging
 import time
 import uuid
 import threading
+import queue
+import io
 from enum import Enum, auto
-from typing import Any, Dict, List, OrderedDict, Tuple, cast
+from typing import Any, Dict, List, OrderedDict, Tuple, cast, Optional
 from dataclasses import dataclass
 
 import torch
@@ -11,7 +13,7 @@ import torch
 from mlora.config import MLoRAConfig
 from mlora.config.task import TaskConfig
 from mlora.config.config import DictConfig
-from mlora.model.args import LinearInfo, MLoRAData, ModelData
+from mlora.model.args import LinearInfo, MLoRAData, ModelData, ModelDataConfig
 from mlora.model.llm import LLMModel
 from mlora.model.llm.model_llama import precompute_mask
 from mlora.model.tokenizer import Tokenizer
@@ -20,9 +22,7 @@ from mlora.utils.gpu_state import AdapterProfile
 from .dispatcher import DISPATCHER_CLASS, PipeDispatcher
 from .executor import Executor
 from .pipeline.function import RecvOperator, SendOperator
-from .pipeline.messages import PipeMessage, PipeMessageType
-from .pipeline.queue import DeviceSwapQueue
-from .pipeline.rpc_transport import RpcTransport
+from .pipeline.nccl_transport import NcclTransport, PipeMessage, PipeMessageType
 from .pipeline.stream import CudaStream
 from .task import Task
 from flops_profiler.profiler import get_model_profile
@@ -34,6 +34,29 @@ class WorkerRole(Enum):
     MID = auto()
     TAIL = auto()
 
+##FIXME
+def loss_fn(
+        config: ModelDataConfig, input: torch.Tensor, target: torch.Tensor, _: torch.Tensor
+    ) -> torch.Tensor:
+        vocab_size = input.shape[-1]
+        loss_input = (
+            input[config.batch_start_idx_:config.batch_end_idx_, :-1, :].contiguous().view(-1, vocab_size)
+        )
+        loss_target = (
+            target[config.batch_start_idx_:config.batch_end_idx_, 1:]
+            .contiguous()
+            .view(-1)
+            .to(loss_input.device)
+        )
+
+        ##FIXME
+        # loss: torch.Tensor = self.context_.loss_fn_(loss_input, loss_target)
+        loss_fn = torch.nn.CrossEntropyLoss()
+        loss = loss_fn(loss_input, loss_target)
+
+        logging.info(f"Adapter {config.adapter_name_} loss: {loss}")
+
+        return loss
 
 class PipeExecutor(Executor):
     role_: WorkerRole
@@ -50,8 +73,7 @@ class PipeExecutor(Executor):
     recompute_: bool
     mlora_config: DictConfig
 
-    input_queue_: DeviceSwapQueue
-    transport_: RpcTransport
+    transport_: NcclTransport
 
     # cache some tensor
     backward_cache_: Dict[int, torch.Tensor]
@@ -67,7 +89,7 @@ class PipeExecutor(Executor):
         config: MLoRAConfig,
         device: str,
         rank: int,
-        nodes: int,
+        world_size: int,
         recompute: bool = False,
     ) -> None:
         self.model_ = model
@@ -78,7 +100,7 @@ class PipeExecutor(Executor):
 
         self.device_ = device
         self.rank_ = rank
-        self.world_size_ = nodes
+        self.world_size_ = world_size
 
         self.hidden_size_ = self.model_.dim_
 
@@ -105,22 +127,22 @@ class PipeExecutor(Executor):
         #     with_stack=False
         # )
 
-        a = 0
-        for partial_layer in self.partial_model_:
-            logging.info(f"Layer {a}: {partial_layer.name()}")
-            a += 1
+        # a = 0
+        # for partial_layer in self.partial_model_:
+        #     logging.info(f"Layer {a}: {partial_layer.name()}")
+        #     a += 1
 
         self.default_stream_ = CudaStream(torch.cuda.default_stream(self.device_))
         
         # n = len(self.mlora_config.adapters().items())
         n = config.dispatcher_.concurrency_num_
 
-        # init the rpc and wait the cluster node ready
-        self.transport_ = RpcTransport(
-            self.rank_, self.world_size_, torch.device(self.device_)
-        )
+        self.header_queue = queue.Queue()
+        self.transport_ = NcclTransport(rank, world_size, device, header_queue=self.header_queue)
 
-        # config.dispatcher_.concurrency_num_ = n # eventually I should get rid of the logic to process this entirely
+        # pipeline neighbors
+        self.prev_rank = rank - 1 if rank > 0 else None
+        self.next_rank = rank + 1 if rank < world_size - 1 else None
 
         self.dispatcher_: PipeDispatcher = cast(
             PipeDispatcher, DISPATCHER_CLASS["pipe"](config.dispatcher_, {})
@@ -141,10 +163,6 @@ class PipeExecutor(Executor):
         # init the different worker
         if self.rank_ == 0:
             self.role_ = WorkerRole.HEAD
-            self.input_queue_ = DeviceSwapQueue(
-                torch.device("cpu"), torch.device(self.device_), 4, "input_data_queue"
-            )
-            self.input_queue_.start()
         elif self.rank_ == self.world_size_ - 1:
             self.role_ = WorkerRole.TAIL
         else:
@@ -257,8 +275,7 @@ class PipeExecutor(Executor):
 
     def __head_worker_run(self):
         while True:
-            # we get the model's output, and calc the loss
-            self.__process_comm()
+            self.__recv_comm()
             self.__process_backward()
             self.__process_output()
             self.__process_input()
@@ -266,14 +283,21 @@ class PipeExecutor(Executor):
 
     def __not_head_worker_run(self):
         while True:
-            self.__process_comm()
+            self.__recv_comm()
             self.__process_backward()
             self.__process_forward()
             time.sleep(1 / 100000)
 
-    def __head_process_step(self, message: PipeMessage):
-        assert message.model_data_ is not None
-        train_data: MLoRAData = self.input_cache_[message.model_data_.random_id_]
+    def __tail_worker_run(self):
+        while True:
+            self.__recv_comm()
+            self.__process_tail_forward_and_backward()
+            time.sleep(1 / 100000)
+
+    def __head_process_step(self, message):
+        # assert message.model_data_ is not None
+        # train_data: MLoRAData = self.input_cache_[message.model_data_.random_id_]
+        train_data: MLoRAData = self.input_cache_[message.random_id_]
 
         # like dpo one task have two data config
         task_names = set()
@@ -284,30 +308,32 @@ class PipeExecutor(Executor):
             self.dispatcher_.task_step(task_name)
             self.dispatcher_.unlock_task(task_name)
 
-        assert message.model_data_ is not None
-        del self.input_cache_[message.model_data_.random_id_]
+        # assert message.model_data_ is not None
+        # del self.input_cache_[message.model_data_.random_id_]
+        del self.input_cache_[message.random_id_]
 
     def __process_backward(self):
-        message = self.transport_.recv_message(PipeMessageType.GRADIENTS, block=False)
+        message = self.transport_.recv_message("next")
         if message is None:
             return
 
-        logging.debug(
-            f"Recv the gradients - {str(message.msg_id_)[:8]} from {message.src_}."
-        )
+        logging.info(f"[Rank {self.rank_}] Received gradient message from next.")
+        logging.info(f"backward cache: {self.backward_cache_}")
 
-        msg_id = message.msg_id_
+        model_data = None
+        if getattr(message, "meta_tensor_", None) is not None:
+            meta_bytes = bytes(message.meta_tensor_.cpu().tolist())
+            buffer = io.BytesIO(meta_bytes)
+            model_data = torch.load(buffer)
 
-        tn = message.model_data_.task_name_[0]
-        key = (tn, msg_id)
+        tn = model_data.task_name_[0]
+        key = model_data.random_id_
 
-        assert key in self.backward_cache_
+        assert key in self.backward_cache_, f"Backward cache miss for key {key}"
 
         torch.cuda.reset_peak_memory_stats(device=self.device_)
 
         phony: torch.Tensor = self.backward_cache_.pop(key)
-        phony.grad_fn.grad_from_next_worker = message.tensor_data_  # type: ignore
-
         gradient_tensor = message.tensor_data_.to(self.device_)
         phony.grad_fn.grad_from_next_worker = gradient_tensor
 
@@ -316,112 +342,188 @@ class PipeExecutor(Executor):
             bwd_end_event = torch.cuda.Event(enable_timing=True)
 
             bwd_start_event.record()
-
             phony.backward()
-
             bwd_end_event.record()
 
-            model_data = message.model_data_
-            batch_id = model_data.random_id_
-            
-            # Check if we have a start event for this batch
-            if batch_id in self.latency_events_:
-                start_event = self.latency_events_.pop(batch_id) # pop to clean up
+            if key is not None and key in self.latency_events_:
+                start_event = self.latency_events_.pop(key)
                 end_event = torch.cuda.Event(enable_timing=True)
                 end_event.record()
-                
                 torch.cuda.synchronize()
 
                 fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
                 logging.info(f"Forward pass peak memory (Rank {self.rank_}): {fwd_peak_memory_mb:.2f} MB")
 
                 bwd_latency_ms = bwd_start_event.elapsed_time(bwd_end_event)
-                logging.info(
-                    f"   Head Backward Pass Latency: {bwd_latency_ms:.4f} ms"
-                )
-                
+                logging.info(f"   Head Backward Pass Latency: {bwd_latency_ms:.4f} ms")
+
                 total_latency_ms = start_event.elapsed_time(end_event)
-                logging.info(
-                    f"   Total Batch Latency (Fwd->Bwd): {total_latency_ms:.4f} ms"
-                )
+                logging.info(f"   Total Batch Latency (Fwd->Bwd): {total_latency_ms:.4f} ms")
         else:
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
 
             torch.cuda.reset_peak_memory_stats(device=self.device_)
-            
-            start_event.record()
-    
-            phony.backward()
 
+            start_event.record()
+            phony.backward()
             end_event.record()
 
             bwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
             logging.info(f"Backward pass peak memory (Rank {self.rank_}): {bwd_peak_memory_mb:.2f} MB")
-            
+
             torch.cuda.synchronize()
             latency_ms = start_event.elapsed_time(end_event)
             logging.info(f"   Backward Pass Latency (Rank {self.rank_}): {latency_ms:.4f} ms")
 
         if self.role_ == WorkerRole.HEAD:
-            self.__head_process_step(message)
+            self.__head_process_step(model_data)
         else:
-            assert message.model_data_ is not None
-            for task_name in message.model_data_.task_name_:
+            for task_name in model_data.task_name_:
                 self.dispatcher_.dispatch_task_to_step(task_name)
 
     def __process_forward(self):
         assert self.role_ != WorkerRole.HEAD
 
-        # recv the tensors from prev-worker
-        message = self.transport_.recv_message(PipeMessageType.ACTIVATIONS, block=False)
+        message = self.transport_.recv_message("prev", only_type=PipeMessageType.TENSOR)
         if message is None:
             return
 
-        logging.debug(
-            f"Recv the activations - {str(message.msg_id_)[:8]} from {message.src_}."
-        )
+        logging.info(f"[Rank {self.rank_}] Received activation message from prev.")
+
+        model_data = None
+        if getattr(message, "meta_tensor_", None) is not None:
+            meta_bytes = bytes(message.meta_tensor_.cpu().tolist())
+            buffer = io.BytesIO(meta_bytes)
+            model_data = torch.load(buffer)
 
         data = RecvOperator.apply(
-            torch.tensor(1.0, requires_grad=True), self.transport_, message
+            torch.tensor(1.0, requires_grad=True, device=self.device_),
+            self.transport_,
+            message,
+            "tail"
         )
 
         torch.cuda.reset_peak_memory_stats(device=self.device_)
-
-        # we need to wait the default stream calcuate all tensor
-        # and then send it, so we hook the pre stage fn to poll the stream
-        data.grad_fn.pre_stage_fn = self.default_stream_.poll  # type: ignore
-        assert message.model_data_ is not None
+        data.grad_fn.pre_stage_fn = self.default_stream_.poll
 
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
-        
-        start_event.record()
-        
-        data = self.__forward(data, message.model_data_)
 
+        start_event.record()
+        data = self.__forward(data, model_data)
         end_event.record()
 
         fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
         logging.info(f"Forward pass peak memory (Rank{self.rank_}): {fwd_peak_memory_mb:.2f} MB")
-        
-        torch.cuda.synchronize() # Wait for the forward pass to complete
+
+        torch.cuda.synchronize()
         latency_ms = start_event.elapsed_time(end_event)
         logging.info(f"   Forward Pass Latency (Rank {self.rank_}): {latency_ms:.4f} ms")
 
         self.default_stream_.poll()
-        assert message.model_data_ is not None
-        return self.__send_activations(data, message.model_data_)
 
-    def __process_comm(self):
-        try:
-            msg: PipeMessage = self.transport_.recv_comm(
-                PipeMessageType.COMM, block=False
-            )
-            comm_data = msg.comm_data_
-        except Exception:
+        return self.__send_activations(data, model_data)
+
+    def __process_tail_forward_and_backward(self):
+        assert self.role_ != WorkerRole.HEAD
+
+        message = self.transport_.recv_message("prev", only_type=PipeMessageType.TENSOR)
+        if message is None:
             return
 
+        logging.info(f"[Rank {self.rank_}] Received activation message from prev.")
+
+        model_data = None
+        if getattr(message, "meta_tensor_", None) is not None:
+            meta_bytes = bytes(message.meta_tensor_.cpu().tolist())
+            buffer = io.BytesIO(meta_bytes)
+            model_data = torch.load(buffer)
+
+        data = RecvOperator.apply(
+            torch.tensor(1.0, requires_grad=True, device=self.device_),
+            self.transport_,
+            message,
+            "tail"
+        )
+
+        data.requires_grad_()
+
+        torch.cuda.reset_peak_memory_stats(device=self.device_)
+        data.grad_fn.pre_stage_fn = self.default_stream_.poll
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        start_event.record()
+        data = self.__forward(data, model_data)
+        data.retain_grad()
+        end_event.record()
+
+        fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+        logging.info(f"Forward pass peak memory (Rank{self.rank_}): {fwd_peak_memory_mb:.2f} MB")
+
+        torch.cuda.synchronize()
+        latency_ms = start_event.elapsed_time(end_event)
+        logging.info(f"   Forward Pass Latency (Rank {self.rank_}): {latency_ms:.4f} ms")
+
+        self.default_stream_.poll()
+
+        labels = torch.tensor(model_data.batch_tokens_, dtype=torch.long, device=self.device_)
+        masks = torch.tensor(model_data.batch_mask_, device=self.device_)
+
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        torch.cuda.reset_peak_memory_stats(device=self.device_)
+
+        start_event.record()
+
+        total_loss = None
+        for config in model_data.data_config_:
+            # loss = config.loss_fn_(out, labels, masks)
+            loss = loss_fn(config, data, labels, masks)
+            if loss is None:
+                continue
+            total_loss = loss if total_loss is None else total_loss + loss
+
+        if total_loss is None:
+            logging.warning("tail: no loss computed")
+            return
+
+        logging.info(f"[Tail] computed loss {total_loss.item()}; calling backward()")
+        total_loss.backward()
+        end_event.record()
+
+        bwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+        logging.info(f"Backward pass peak memory (Rank {self.rank_}): {bwd_peak_memory_mb:.2f} MB")
+
+        torch.cuda.synchronize()
+        latency_ms = start_event.elapsed_time(end_event)
+        logging.info(f"   Backward Pass Latency (Rank {self.rank_}): {latency_ms:.4f} ms")
+
+        gradient_to_send = data.grad
+        assert gradient_to_send is not None, "Input gradient is None after backward pass."
+        logging.info(f"[Rank {self.rank_}] Sending gradient back to previous stage.")
+
+        buffer = io.BytesIO()
+        torch.save(model_data, buffer)
+        buffer.seek(0)
+        meta_bytes = torch.ByteTensor(list(buffer.getvalue())).to(self.device_)
+
+        grad_message = PipeMessage(
+            msg_type=PipeMessageType.TENSOR,
+            tensor=gradient_to_send,
+            comm_data=None,
+            meta_tensor=meta_bytes
+        )
+
+        self.transport_.send_message(grad_message, "prev")
+
+        for task_name in model_data.task_name_:
+            self.dispatcher_.dispatch_task_to_step(task_name)
+
+    def __handle_comm(self, comm_data):
         if comm_data["comm"] == "task_add":
             self.add_task(comm_data["data"])
         elif comm_data["comm"] == "task_running":
@@ -433,22 +535,25 @@ class PipeExecutor(Executor):
         elif comm_data["comm"] == "task_terminal":
             self.dispatcher_.dispatch_task_to_terminal(comm_data["data"])
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"Unknown comm type: {comm_data}")
 
     def __process_output(self):
         assert self.role_ == WorkerRole.HEAD
 
         # recv the tensors from prev-worker
-        message = self.transport_.recv_message(PipeMessageType.ACTIVATIONS, block=False)
-        if message is None:
+        message = self.transport_.recv_message("prev", block=False)
+        if message is None or message.msg_type_ != PipeMessageType.TENSOR:
             return
 
-        logging.debug(
-            f"Recv the activations - {str(message.msg_id_)[:8]} from {message.src_}."
+        logging.info(
+            f"Recv the activations - {str(message.msg_id_)[:8]} from prev."
         )
 
         output: torch.Tensor = RecvOperator.apply(
-            torch.tensor(1.0, requires_grad=True), self.transport_, message
+            torch.tensor(1.0, requires_grad=True, device=self.device_),
+            self.transport_,
+            message,
+            "head"
         )
 
         # we need to wait the default stream calcuate all tensor
@@ -481,7 +586,7 @@ class PipeExecutor(Executor):
         train_data: MLoRAData | None = self.dispatcher_.data()
         if train_data is None:
             return
-        # step1. get the model data and execute the forward
+
         tensor_data = torch.tensor(
             train_data.batch_tokens_,
             dtype=torch.long,
@@ -500,36 +605,104 @@ class PipeExecutor(Executor):
         end_event.record()
         torch.cuda.synchronize()
         latency_ms = start_event.elapsed_time(end_event)
-
         logging.info(f"    Head Node Forward Latency: {latency_ms:.4f} ms")
 
-        # step2. then send the hidden state to next worker
+        # step2. send hidden state to next worker via SendOperator
         self.default_stream_.poll()
-        self.__send_activations(hidden_data, train_data.model_data())
 
-        # step3. cache the input, we need it to calc the loss
+        buffer = io.BytesIO()
+        torch.save(train_data.model_data(), buffer)
+        buffer.seek(0)
+        meta_bytes = torch.ByteTensor(list(buffer.getvalue())).to(self.device_)
+
+        send_msg = PipeMessage(
+            PipeMessageType.TENSOR,
+            tensor=hidden_data,
+            meta_tensor=meta_bytes,
+            comm_data=None,
+        )
+        phony = SendOperator.apply(hidden_data, self.transport_, send_msg, "head")
+
+        # step3. cache the input for loss calc
         self.input_cache_[train_data.model_data().random_id_] = train_data
 
+        # tn = train_data.model_data().task_name_[0] if train_data.model_data() is not None else "unknown"
+        self.backward_cache_[int(train_data.model_data().random_id_)] = phony
+
     def __send_activations(self, tensor_data: torch.Tensor, batch_data: ModelData):
+        ##FIXME
+        if self.next_rank == None:
+            return
+
         assert isinstance(tensor_data, torch.Tensor)
         assert batch_data is None or isinstance(batch_data, ModelData)
 
-        msg_id = uuid.uuid4().int
-        assert msg_id not in self.backward_cache_
+        batch_random_id = batch_data.random_id_ if batch_data is not None else uuid.uuid4().int
+        rid = batch_random_id % (2**63 - 1)
 
-        phony: torch.Tensor = SendOperator.apply(
-            torch.tensor(1.0, requires_grad=True),
-            tensor_data,
-            self.transport_,
-            msg_id,
-            batch_data,
+        msg = PipeMessage(
+            PipeMessageType.TENSOR,
+            tensor=tensor_data,
+            meta_tensor=torch.tensor([rid], dtype=torch.int64, device=self.device_),
+            comm_data=batch_data,
         )
 
-        tn = batch_data.task_name_[0]
-        self.backward_cache_[(tn, msg_id)] = phony
+        phony: torch.Tensor = SendOperator.apply(
+            torch.tensor(1.0, requires_grad=True, device=self.device_),
+            self.transport_,
+            msg,
+            "tail"
+        )
 
-    def __send_comm(self, data: Any):
-        self.transport_.send_comm(PipeMessageType.COMM, data)
+        tn = batch_data.task_name_[0] if batch_data is not None else "unknown"
+        self.backward_cache_[(tn, int(rid))] = phony
+
+    def __send_comm(self, data: Any, dst: Optional[int] = None) -> None:
+        if dst is None:
+            if hasattr(self, "next_rank"):
+                dst = self.next_rank
+            else:
+                try:
+                    dst = self._name_to_rank(self.next_worker_name)
+                except Exception:
+                    dst = None
+
+        if dst is None:
+            logging.info(f"[Rank {self.rank_}] __send_comm called but no dst available.")
+            return
+
+        msg = PipeMessage(PipeMessageType.COMM, tensor=None, comm_data=data, meta_tensor=None)
+        if dst == (self.rank_ + 1):
+            neighbor = "next"
+        elif dst == (self.rank_ - 1):
+            neighbor = "prev"
+        else:
+            neighbor = "next" if dst > self.rank_ else "prev"
+
+        self.transport_.send_message(msg, neighbor)
+
+    def __recv_comm(self):
+        for neighbor in ["prev", "next"]:
+            if neighbor == "next" and self.next_rank is None:
+                continue
+            elif neighbor == "prev" and self.prev_rank is None:
+                continue
+
+            msg = self.transport_.recv_message(neighbor, block=True, only_type=PipeMessageType.COMM)
+            if msg is None:
+                continue
+
+            logging.info(f"[Rank {self.rank_}] Received comm from {neighbor}")
+            self.__handle_comm(msg.comm_data_)
+
+    def send_tensor(self, tensor, dst):
+        msg = PipeMessage(PipeMessageType.TENSOR, tensor=tensor)
+        self.transport_.send_message(msg, dst)
+
+    def recv_tensor(self, src):
+        msg = self.transport_.recv_message(src)
+        assert msg.msg_type_ == PipeMessageType.TENSOR
+        return msg.tensor_data_
 
     def __forward(self, tensor_data: torch.Tensor, batch_data: ModelData):
         mask = precompute_mask(
@@ -545,8 +718,10 @@ class PipeExecutor(Executor):
     def execute(self) -> None:
         if self.role_ == WorkerRole.HEAD:
             self.__head_worker_run()
-        elif self.role_ == WorkerRole.MID or self.role_ == WorkerRole.TAIL:
+        elif self.role_ == WorkerRole.MID:
             self.__not_head_worker_run()
+        elif self.role_ == WorkerRole.TAIL:
+            self.__tail_worker_run()
         else:
             raise NotImplementedError
 

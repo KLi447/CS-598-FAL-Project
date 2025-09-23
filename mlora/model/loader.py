@@ -27,7 +27,7 @@ def load_partial_model(args) -> LLMModel:
     assert args.nodes >= args.rank
 
     logging.info(
-        f"Pipeline parallelism, rank is {args.rank} and distributed over {args.nodes} nodes."
+        f"Pipeline parallelism, rank is {args.rank} and distributed over {args.nodes} gpus."
     )
 
     if "llama" in args.base_model.lower():

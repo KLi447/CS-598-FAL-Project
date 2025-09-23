@@ -1,78 +1,82 @@
 import logging
-
 import torch
-
 from mlora.model.args import ModelData
-
-from .messages import PipeMessage, PipeMessageType
-from .transport import Transport
-
-
-class SendOperator(torch.autograd.Function):
-    # helper to reduce the activation memory
-    @staticmethod
-    def forward(
-        ctx,
-        phony: torch.Tensor,
-        tensor_data: torch.Tensor,
-        transport: Transport,
-        msg_id: int,
-        input_args: ModelData,
-    ):
-        assert isinstance(tensor_data, torch.Tensor)
-
-        msg = PipeMessage(
-            src_=transport.worker_name,
-            dst_=transport.next_worker_name,
-            msg_type_=PipeMessageType.ACTIVATIONS,
-            msg_id_=msg_id,
-            tensor_data_=tensor_data,
-            model_data_=input_args,
-            comm_data_=None,
-        )
-        transport.send_message(msg, False)
-
-        return phony
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        assert ctx.grad_from_next_worker is not None
-
-        return (None, ctx.grad_from_next_worker, None, None, None)
+from typing import Any
+from .nccl_transport import NcclTransport, PipeMessage, PipeMessageType
 
 
 class RecvOperator(torch.autograd.Function):
-    # backward will auto send the grad to pre worker
     @staticmethod
-    def forward(
-        ctx, phony: torch.Tensor, transport: Transport, msg: PipeMessage
-    ) -> torch.Tensor:
-        assert msg.msg_type_ == PipeMessageType.ACTIVATIONS
-        assert isinstance(msg.tensor_data_, torch.Tensor)
+    def forward(ctx, dummy: torch.Tensor, transport, message: PipeMessage, role: str):
+        if message is None:
+            raise RuntimeError("RecvOperator.forward called with message=None")
+        assert message.msg_type_ == PipeMessageType.TENSOR, \
+            "RecvOperator.forward expected a TENSOR message"
 
-        ctx.msg_id_ = msg.msg_id_
-        ctx.transport_ = transport
-        ctx.model_data_ = msg.model_data_
+        ctx.transport = transport
+        ctx.role = role
+        ctx.meta_tensor = getattr(message, "meta_tensor_", None)
+        ctx.comm_data = getattr(message, "comm_data_", None)
 
-        return msg.tensor_data_ * phony
+        out = message.tensor_data_
+        if not out.requires_grad:
+            out = out.requires_grad_(True)
+
+        if role == "tail":
+            out.retain_grad()
+
+            def _grad_hook(grad: torch.Tensor):
+                grad_msg = PipeMessage(
+                    PipeMessageType.TENSOR,
+                    tensor=grad.detach(),
+                    meta_tensor=ctx.meta_tensor,
+                    comm_data=ctx.comm_data,
+                )
+                ctx.transport.send_message(grad_msg, "prev")
+                logging.info("[Tail] Sent initial gradient upstream.")
+
+            out.register_hook(_grad_hook)
+            return out
+    
+        return out
 
     @staticmethod
-    def backward(ctx, *grad_outputs: torch.Tensor):
-        transport: Transport = ctx.transport_
-        if hasattr(ctx, "pre_stage_fn") and ctx.pre_stage_fn is not None:
-            ctx.pre_stage_fn()
+    def backward(ctx, grad_output: torch.Tensor):
+        if ctx.role == "tail":
+            return None, None, None, None
 
-        logging.debug(f"Send the gradients to {transport.prev_worker_name}")
-        transport.send_message(
-            PipeMessage(
-                src_=transport.worker_name,
-                dst_=transport.prev_worker_name,
-                msg_type_=PipeMessageType.GRADIENTS,
-                msg_id_=ctx.msg_id_,
-                tensor_data_=grad_outputs[0],
-                model_data_=ctx.model_data_,
-                comm_data_=None,
-            )
+        grad_payload = grad_output.detach()
+        grad_msg = PipeMessage(
+            PipeMessageType.TENSOR,
+            tensor=grad_payload,
+            meta_tensor=getattr(ctx, "meta_tensor", None),
+            comm_data=getattr(ctx, "comm_data", None),
         )
+        ctx.transport.send_message(grad_msg, "prev")
+        logging.info(f"[{ctx.role.capitalize()}] Sent gradient upstream.")
+        return None, None, None, None
 
-        return (None, None, None)
+
+class SendOperator(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, dummy: torch.Tensor, transport, message: PipeMessage, role: str):
+        if message is None:
+            raise RuntimeError("SendOperator.forward called with message=None")
+
+        ctx.transport = transport
+        ctx.role = role
+        ctx.meta_tensor = getattr(message, "meta_tensor_", None)
+        ctx.comm_data = getattr(message, "comm_data_", None)
+
+        if role == "tail":
+            return message.tensor_data_
+
+        transport.send_message(message, "next")
+
+        device = getattr(transport, "device", None) or torch.device("cpu")
+        phony = torch.tensor(1.0, requires_grad=True, device=device)
+        return phony
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return None, None, None, None
