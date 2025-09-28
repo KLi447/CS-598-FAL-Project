@@ -20,9 +20,16 @@ import mlora.model
 import mlora.utils
 import mlora.executor
 import mlora.config
+import os
 
 if __name__ == "__main__":
     args = mlora.utils.get_cmd_args()
+
+    rank = os.environ['LOCAL_RANK']
+    args.rank = int(rank)
+    # args.device += str(rank)
+    args.device = "cuda:" + str(rank)
+    args.nodes = 2
 
     mlora.utils.setup_seed(args.seed)
     mlora.utils.setup_logging(args.log_level, args.log_file)

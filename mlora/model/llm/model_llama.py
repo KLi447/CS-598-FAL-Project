@@ -132,8 +132,7 @@ class LlamaSequentialWrapper(torch.nn.Module):
         module_name = self.name()
         assert (
             module_name in forward_func_dict
-        ), f"error module name {
-            module_name}"
+        ), f"error module name {module_name}"
 
         return forward_func_dict[module_name]()
 
