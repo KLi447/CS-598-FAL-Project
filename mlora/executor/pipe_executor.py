@@ -1,13 +1,12 @@
 import logging
 import time
-import uuid
 import threading
 import queue
 import io
 from enum import Enum, auto
 from typing import Any, Dict, List, OrderedDict, Tuple, cast, Optional
 from dataclasses import dataclass
-
+from torch.profiler import profile as TorchProfile, ProfilerActivity
 import torch
 
 from mlora.config import MLoRAConfig
@@ -18,7 +17,6 @@ from mlora.model.llm import LLMModel
 from mlora.model.llm.model_llama import precompute_mask
 from mlora.model.tokenizer import Tokenizer
 from mlora.utils.gpu_state import AdapterProfile
-from torch.profiler import profile as TorchProfile, schedule, ProfilerActivity, record_function, tensorboard_trace_handler
 from torch.utils.tensorboard import SummaryWriter
 
 from .dispatcher import DISPATCHER_CLASS, PipeDispatcher
@@ -30,11 +28,7 @@ from .task import Task
 from flops_profiler.profiler import get_model_profile
 from collections import namedtuple
 import os
-import subprocess
-from queue import Queue, Empty
-import torch
 import torch.nn.functional as F
-import re
 
 class WorkerRole(Enum):
     HEAD = auto()
@@ -105,10 +99,51 @@ class PipeExecutor(Executor):
         self.mlora_config = config
 
         self.device_ = device
+        # Ensure CUDA primary context exists on this process
+        torch.cuda.set_device(torch.device(self.device_))
         self.rank_ = rank
         self.world_size_ = world_size
-
         self.hidden_size_ = self.model_.dim_
+
+        self._nvml_idx = int(str(self.device_).split(":")[-1])
+        self._nvml = None
+        self._util_buf = []
+        self._util_lock = threading.Lock()
+        self._util_stop = threading.Event()
+
+        try:
+            import pynvml  # type: ignore
+            pynvml.nvmlInit()
+            self._nvml = {
+                "lib": pynvml,
+                "handle": pynvml.nvmlDeviceGetHandleByIndex(self._nvml_idx),
+            }
+            logging.info(f"[Rank {self.rank_}] NVML initialized for device {self._nvml_idx}")
+
+            def _sample_util_loop():
+                lib = self._nvml["lib"]
+                h   = self._nvml["handle"]
+                while not self._util_stop.is_set():
+                    try:
+                        u = lib.nvmlDeviceGetUtilizationRates(h)   # sm% and mem% over a short window
+                        m = lib.nvmlDeviceGetMemoryInfo(h)         # bytes used / total
+                        now = time.time()
+                        with self._util_lock:
+                            self._util_buf.append((now, float(u.gpu), float(u.memory),
+                                                float(m.used), float(m.total)))
+                            # keep only last 10s
+                            cutoff = now - 10.0
+                            while self._util_buf and self._util_buf[0][0] < cutoff:
+                                self._util_buf.pop(0)
+                    except Exception:
+                        pass
+                    time.sleep(0.01)  # 10 ms
+            self._util_thread = threading.Thread(target=_sample_util_loop, daemon=True)
+            self._util_thread.start()
+        except Exception as e:
+            logging.warning(f"[Rank {self.rank_}] NVML init/sampler failed: {e}")
+            self._nvml = None
+
 
         self.backward_cache_ = {}
         self.input_cache_ = {}
@@ -116,30 +151,29 @@ class PipeExecutor(Executor):
 
         self.recompute_ = recompute
         self.log_dir_ = getattr(config, "tb_log_dir_", None) or os.environ.get(
-            "MLOTRA_TB_LOGDIR", f"/projects/beis/akanodia/CS-598-FAL-Project/runs/llama_job_1/rank{self.rank_}"
+            "MLOTRA_TB_LOGDIR", f"/projects/beis/akanodia/CS-598-FAL-Project/runs/qwen_job_1_2_FINE_GRAIN/rank{self.rank_}"
         )
         os.makedirs(self.log_dir_, exist_ok=True)
 
-        wait_steps   = int(os.environ.get("MLOTRA_PROF_WAIT", "1"))
-        warmup_steps = int(os.environ.get("MLOTRA_PROF_WARMUP", "1"))
-        active_steps = int(os.environ.get("MLOTRA_PROF_ACTIVE", "47")) # profile the rest 47 etc after skipping first 3 (consider when colocated job finished, stop when bigger batch size finishes first)
-        repeat_spans = int(os.environ.get("MLOTRA_PROF_REPEAT", "0"))  # 0 = run once
+        self._prof_enabled     = bool(int(os.environ.get("MLOTRA_PROF_ENABLE", "1")))
+        self._prof_every_n     = int(os.environ.get("MLOTRA_PROF_EVERY_N", "1"))  # profile every N steps
+        self._prof_running     = False
+        self._prof_last_step   = -1
 
         self.profiler_ = TorchProfile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            schedule=schedule(wait=wait_steps, warmup=warmup_steps, active=active_steps, repeat=repeat_spans),
-            on_trace_ready=tensorboard_trace_handler(self.log_dir_),   # writes Chrome trace to TB
-            record_shapes=True,
-            profile_memory=True,                                       # includes CUDA memory
+            record_shapes=False,
+            profile_memory=False,                                       
             with_stack=False,
         )
-        self.profiler_.start()
-        self.writer_ = SummaryWriter(log_dir=self.log_dir_, filename_suffix=f"_rank{self.rank_}")
-        self.global_step_ = 0
+        self.writer_ = SummaryWriter(log_dir=self.log_dir_, filename_suffix=f"_rank{self.rank_}",flush_secs=1,max_queue=10,)
+        self.rank_step_ = 0
         self.__init_worker()
         self.__init_partition()
+        self._step_window_start_ts = time.time()
+        self._last_logged_step = -1
 
-        self.default_stream_ = CudaStream(torch.cuda.default_stream(self.device_))
+        self.default_stream_ = CudaStream(torch.cuda.default_stream(torch.device(self.device_)))
 
         n = config.dispatcher_.concurrency_num_
 
@@ -165,57 +199,42 @@ class PipeExecutor(Executor):
         for hook, cb in hook_func.items():
             self.dispatcher_.register_hook(hook, cb)
 
-
-        # Optional: start nvidia-smi dmon collector if enabled
-        if os.environ.get("MLOTRA_DMON", "0") == "1":
-            self._start_dmon()
-
     # ---------------------------
     # GPU / Memory instrumentation
     # ---------------------------
 
-    def _poll_gpu_stats(self, stop_event: threading.Event, results: List[int]):
-        """Background sampler for instantaneous GPU utilization (%) via NVML."""
-        try:
-            import pynvml
-            pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(int(self.device_.split(":")[-1]))
-            while not stop_event.is_set():
-                util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-                results.append(util.gpu)  # %
-                time.sleep(0.01)
-        except Exception as e:
-            logging.warning(f"GPU poll thread failed: {e}")
-        finally:
+    def _should_profile_this_step(self) -> bool:
+        if not self._prof_enabled:
+            return False
+        # Record only once per global step and only on chosen cadence
+        return (self.rank_step_ % self._prof_every_n == 0) and (self._prof_last_step != self.rank_step_)
+
+    def _prof_start_if_needed(self):
+        if not self._should_profile_this_step():
+            return
+        if not self._prof_running:
             try:
-                pynvml.nvmlShutdown()
+                self.profiler_.start()
+                self._prof_running = True
+                self._prof_last_step = self.rank_step_
             except Exception:
                 pass
 
-    def _start_gpu_monitor(self) -> Tuple[threading.Event, List[int], threading.Thread]:
-        stop_event = threading.Event()
-        util_results = []
-        monitor_thread = threading.Thread(
-            target=self._poll_gpu_stats, args=(stop_event, util_results), daemon=True
-        )
-        monitor_thread.start()
-        return stop_event, util_results, monitor_thread
+    def _prof_step_if_running(self):
+        if self._prof_running:
+            try:
+                self.profiler_.step()
+            except Exception:
+                pass
 
-    def _stop_gpu_monitor(
-        self,
-        context: str,
-        stop_event: threading.Event,
-        util_results: List[int],
-        monitor_thread: threading.Thread,
-    ):
-        stop_event.set()
-        monitor_thread.join()
-        if util_results:
-            avg_util = sum(util_results) / len(util_results)
-            max_util = max(util_results)
-            logging.info(
-                f"GPU UTIL @ {context} (Rank {self.rank_}): Avg: {avg_util:.2f}%, Max: {max_util}%"
-            )
+    def _prof_stop_if_running(self):
+        if self._prof_running:
+            try:
+                self.profiler_.stop()
+            except Exception:
+                pass
+            finally:
+                self._prof_running = False
 
     def _device_total_bytes(self) -> int:
         try:
@@ -227,135 +246,102 @@ class PipeExecutor(Executor):
 
     def _tb_log_gpu_now(self, tag_prefix: str):
         """
-        Push instantaneous GPU + memory stats to TensorBoard.
-        Each call also increments step to guarantee plots advance.
+        Push GPU + memory stats to TensorBoard.
+        - Average NVML strictly over samples collected since the last step boundary.
+        - Log once per (tag_prefix, global_step).
         """
         if self.writer_ is None:
             return None
         try:
             dev = torch.device(self.device_)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize(dev)
 
-                mem_alloc = torch.cuda.memory_allocated(dev)
-                mem_resv  = torch.cuda.memory_reserved(dev)
-                device_total_bytes = self._device_total_bytes()
+            # CUDA allocator stats (instantaneous)
+            mem_alloc = torch.cuda.memory_allocated(dev)
+            mem_resv  = torch.cuda.memory_reserved(dev)
+            device_total_bytes = self._device_total_bytes()
 
-                util_now, nvml_used, nvml_total = None, None, None
-                try:
-                    import pynvml
-                    pynvml.nvmlInit()
-                    idx = int(str(self.device_).split(":")[-1])
-                    h = pynvml.nvmlDeviceGetHandleByIndex(idx)
-                    u = pynvml.nvmlDeviceGetUtilizationRates(h)
-                    util_now = float(u.gpu)
-                    meminfo = pynvml.nvmlDeviceGetMemoryInfo(h)
-                    nvml_used, nvml_total = float(meminfo.used), float(meminfo.total)
-                    pynvml.nvmlShutdown()
-                except Exception as e:
-                    logging.debug(f"NVML unavailable: {e}")
+            util_sm = None
+            util_mem = None
+            nvml_used = None
+            nvml_total = None
+            samples_in_window = 0
 
-                step = self.global_step_
+            # Collect NVML samples only within the current step window
+            tail = []
+            if self._nvml:
+                with self._util_lock:
+                    if self._util_buf:
+                        start_ts = getattr(self, "_step_window_start_ts", None)
+                        if start_ts is not None:
+                            tail = [s for s in self._util_buf if s[0] >= start_ts]
+                        else:
+                            # Fallback: small recent slice to avoid huge averages
+                            tail = self._util_buf[-50:]
 
-                if util_now is not None:
-                    self.writer_.add_scalar(f"{tag_prefix}/gpu_util_pct", util_now, step)
+            if tail:
+                _, sm_list, mem_list, used_list, total_list = zip(*tail)
+                samples_in_window = len(sm_list)
+                # Per-step averages
+                util_sm   = float(sum(sm_list))  / samples_in_window
+                util_mem  = float(sum(mem_list)) / samples_in_window
+                nvml_used = float(sum(used_list)) / samples_in_window
+                nvml_total = float(total_list[-1])  # constant across samples
 
-                self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/allocated_bytes", mem_alloc, step)
-                self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/reserved_bytes",  mem_resv,  step)
+                # Clamp to sane bounds to avoid outliers from transient reads
+                util_sm  = max(0.0, min(100.0, util_sm))
+                util_mem = max(0.0, min(100.0, util_mem))
 
-                if device_total_bytes > 0:
-                    self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/allocated_pct", 
-                                            (mem_alloc/device_total_bytes)*100.0, step)
-                    self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/reserved_pct",  
-                                            (mem_resv/device_total_bytes)*100.0, step)
+            step = self.rank_step_
 
-                if nvml_used is not None and nvml_total:
-                    self.writer_.add_scalar(f"{tag_prefix}/nvml/device_used_bytes", nvml_used, step)
-                    self.writer_.add_scalar(f"{tag_prefix}/nvml/device_used_pct", (nvml_used/nvml_total)*100.0, step)
+            # Prevent duplicate writes in the same step (late callers)
+            if self._last_logged_step == step:
+                return util_sm
+            self._last_logged_step = step
 
-                # immediately flush to disk so TB frontend sees updates
-                self.writer_.flush()
+            # Rolling util over this step window
+            if util_sm is not None:
+                self.writer_.add_scalar(f"{tag_prefix}/gpu_util_pct", util_sm, step)
+            if util_mem is not None:
+                self.writer_.add_scalar(f"{tag_prefix}/mem_ctrl_util_pct", util_mem, step)
 
-                logging.info(
-                    f"[Rank {self.rank_}] step {step} | GPU util={util_now}% "
-                    f"| alloc={mem_alloc/1e6:.1f}MB ({(mem_alloc/device_total_bytes*100.0):.1f}%) "
-                    f"| reserved={mem_resv/1e6:.1f}MB ({(mem_resv/device_total_bytes*100.0):.1f}%)"
+            # CUDA allocator + percentage of device
+            self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/allocated_bytes", mem_alloc, step)
+            self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/reserved_bytes",  mem_resv,  step)
+
+            if device_total_bytes > 0:
+                self.writer_.add_scalar(
+                    f"{tag_prefix}/cuda_mem/allocated_pct",
+                    (mem_alloc / device_total_bytes) * 100.0,
+                    step,
                 )
-                # increment after logging so each call produces new X-axis point
-                self.global_step_ += 1
-                return util_now
+                self.writer_.add_scalar(
+                    f"{tag_prefix}/cuda_mem/reserved_pct",
+                    (mem_resv / device_total_bytes) * 100.0,
+                    step,
+                )
+
+            if (nvml_used is not None) and nvml_total:
+                self.writer_.add_scalar(f"{tag_prefix}/nvml/device_used_bytes", nvml_used, step)
+                self.writer_.add_scalar(
+                    f"{tag_prefix}/nvml/device_used_pct",
+                    (nvml_used / nvml_total) * 100.0,
+                    step,
+                )
+
+            # Helpful debug: how many NVML samples this step used
+            self.writer_.add_scalar(f"{tag_prefix}/nvml/samples_in_window", samples_in_window, step)
+
+            self.writer_.flush()
+            return util_sm
+
         except Exception as e:
             logging.warning(f"TB GPU log failed: {e}")
-        return None
-
-    def _profiler_step(self, where: str):
-        """Advance profiler once per pipeline 'step' and also log pipeline step marker."""
-        if self.writer_:
-            self.writer_.add_scalar("pipeline/step", self.global_step_, self.global_step_)
-            self.writer_.flush()
-        if self.profiler_ is not None:
-            self.profiler_.step()
+            return None
 
 
-    # -------- dmon (optional) --------
-    def _start_dmon(self):
-        """Start `nvidia-smi dmon` and a reader thread to emit TB scalars. Set MLOTRA_DMON=1 to enable."""
-        try:
-            self._dmon_stop_evt_ = threading.Event()
-            self._dmon_queue_ = Queue()
-            self._dmon_proc_ = subprocess.Popen(
-                ["nvidia-smi", "dmon", "-s", "pmf", "-d", "1", "-o", "DT"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-            )
-
-            def _reader():
-                header = None
-                for line in self._dmon_proc_.stdout:
-                    if self._dmon_stop_evt_.is_set():
-                        break
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        if "pwr" in line and "sm" in line:
-                            header = re.split(r"\s+", line.lstrip("#").strip())
-                        continue
-                    if header is None:
-                        continue
-                    cols = re.split(r"\s+", line)
-                    row = dict(zip(header, cols))
-                    self._dmon_queue_.put(row)
-
-            def _consumer():
-                while not self._dmon_stop_evt_.is_set():
-                    try:
-                        row = self._dmon_queue_.get(timeout=1.0)
-                    except Empty:
-                        continue
-                    try:
-                        if self.writer_:
-                            for k in ("pwr", "sm", "mem", "fb"):
-                                if k in row:
-                                    self.writer_.add_scalar(f"dmon/{k}_rank{self.rank_}", float(row[k]), self.global_step_)
-                            for k in ("rxpci", "txpci"):
-                                if k in row:
-                                    self.writer_.add_scalar(f"dmon/{k}_MBs_rank{self.rank_}", float(row[k]), self.global_step_)
-                    except Exception:
-                        pass
-
-            self._dmon_thread_ = threading.Thread(target=_reader, daemon=True)
-            self._dmon_thread_.start()
-            threading.Thread(target=_consumer, daemon=True).start()
-            logging.info("nvidia-smi dmon started for TB logging.")
-        except Exception as e:
-            logging.warning(f"Could not start nvidia-smi dmon: {e}")
-
-    def _stop_dmon(self):
-        if getattr(self, "_dmon_stop_evt_", None):
-            self._dmon_stop_evt_.set()
-        if getattr(self, "_dmon_proc_", None):
-            try:
-                self._dmon_proc_.terminate()
-            except Exception:
-                pass
+    def _mark_step_boundary(self):
+        self._step_window_start_ts = time.time()
+        self._last_logged_step = -1
 
     # ---------------------------
     # Pipeline setup
@@ -465,11 +451,10 @@ class PipeExecutor(Executor):
 
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
-            torch.cuda.synchronize(self.device_)
             start_event.record()
             _ = self.partial_model_(dummy_tuple)
             end_event.record()
-            torch.cuda.synchronize(self.device_)
+            end_event.synchronize()
             latency_ms = max(0.0, float(start_event.elapsed_time(end_event)))
 
             param_bytes = float(params) * 2.0
@@ -550,14 +535,13 @@ class PipeExecutor(Executor):
         if getattr(message, "meta_tensor_", None) is not None:
             meta_bytes = bytes(message.meta_tensor_.cpu().tolist())
             buffer = io.BytesIO(meta_bytes)
-            model_data = torch.load(buffer)
+            model_data = torch.load(buffer, weights_only=False)
 
-        tn = model_data.task_name_[0]
         key = model_data.random_id_
 
         assert key in self.backward_cache_, f"Backward cache miss for key {key}"
 
-        torch.cuda.reset_peak_memory_stats(device=self.device_)
+        torch.cuda.reset_peak_memory_stats(device=torch.device(self.device_))
 
         phony: torch.Tensor = self.backward_cache_.pop(key)
         gradient_tensor = message.tensor_data_.to(self.device_)
@@ -566,18 +550,21 @@ class PipeExecutor(Executor):
         if self.role_ == WorkerRole.HEAD:
             bwd_start_event = torch.cuda.Event(enable_timing=True)
             bwd_end_event = torch.cuda.Event(enable_timing=True)
-
             bwd_start_event.record()
             phony.backward()
+            self._prof_step_if_running()              
+            self._prof_stop_if_running() 
             bwd_end_event.record()
+            bwd_end_event.synchronize()  # ==== compute fence ====
+
 
             if key is not None and key in self.latency_events_:
                 start_event = self.latency_events_.pop(key)
                 end_event = torch.cuda.Event(enable_timing=True)
                 end_event.record()
-                torch.cuda.synchronize()
+                end_event.synchronize()
 
-                fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+                fwd_peak_memory_mb = torch.cuda.max_memory_allocated(torch.device(self.device_)) / (1024 * 1024)
                 logging.info(f"Forward pass peak memory (Rank {self.rank_}): {self._fmt_peak_with_pct(fwd_peak_memory_mb)}")
 
                 bwd_latency_ms = bwd_start_event.elapsed_time(bwd_end_event)
@@ -586,36 +573,37 @@ class PipeExecutor(Executor):
                 total_latency_ms = start_event.elapsed_time(end_event)
                 logging.info(f"   Total Batch Latency (Fwd->Bwd): {total_latency_ms:.4f} ms")
 
-            # snapshot GPU/mem after head backward
-            self._tb_log_gpu_now(f"gpu_rank{self.rank_}")
-            self._profiler_step("backward")
+        
 
         else:
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
 
-            torch.cuda.reset_peak_memory_stats(device=self.device_)
+            torch.cuda.reset_peak_memory_stats(device=torch.device(self.device_))
 
-            start_event.record()
+            start_event.record()         
             phony.backward()
+            self._prof_step_if_running()            
+            self._prof_stop_if_running()
             end_event.record()
+            end_event.synchronize()  # ==== compute fence ====
 
-            bwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+
+            bwd_peak_memory_mb = torch.cuda.max_memory_allocated(torch.device(self.device_)) / (1024 * 1024)
             logging.info(f"Backward pass peak memory (Rank {self.rank_}): {self._fmt_peak_with_pct(bwd_peak_memory_mb)}")
 
-            torch.cuda.synchronize()
             latency_ms = start_event.elapsed_time(end_event)
             logging.info(f"   Backward Pass Latency (Rank {self.rank_}): {latency_ms:.4f} ms")
 
-            # snapshot for mid workers as well
-            self._tb_log_gpu_now(f"gpu_rank{self.rank_}")
-            self._profiler_step("backward")
 
         if self.role_ == WorkerRole.HEAD:
             self.__head_process_step(model_data)
         else:
             for task_name in model_data.task_name_:
                 self.dispatcher_.dispatch_task_to_step(task_name)
+        self._tb_log_gpu_now(f"gpu_rank{self.rank_}")
+        self.rank_step_ += 1
+
 
     def __process_forward(self):
         assert self.role_ != WorkerRole.HEAD
@@ -630,7 +618,7 @@ class PipeExecutor(Executor):
         if getattr(message, "meta_tensor_", None) is not None:
             meta_bytes = bytes(message.meta_tensor_.cpu().tolist())
             buffer = io.BytesIO(meta_bytes)
-            model_data = torch.load(buffer)
+            model_data = torch.load(buffer, weights_only=False)
 
         data = RecvOperator.apply(
             torch.tensor(1.0, requires_grad=True, device=self.device_),
@@ -639,28 +627,26 @@ class PipeExecutor(Executor):
             "tail"
         )
 
-        torch.cuda.reset_peak_memory_stats(device=self.device_)
+        torch.cuda.reset_peak_memory_stats(device=torch.device(self.device_))
         data.grad_fn.pre_stage_fn = self.default_stream_.poll
-
+        self._mark_step_boundary()
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
 
+        self._prof_start_if_needed()
         start_event.record()
         data = self.__forward(data, model_data)
         end_event.record()
 
-        fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+        fwd_peak_memory_mb = torch.cuda.max_memory_allocated(torch.device(self.device_)) / (1024 * 1024)
         logging.info(f"Forward pass peak memory (Rank {self.rank_}): {self._fmt_peak_with_pct(fwd_peak_memory_mb)}")
 
-        torch.cuda.synchronize()
+        end_event.synchronize()
         latency_ms = start_event.elapsed_time(end_event)
         logging.info(f"   Forward Pass Latency (Rank {self.rank_}): {latency_ms:.4f} ms")
 
         self.default_stream_.poll()
 
-        # snapshot after forward
-        self._tb_log_gpu_now(f"gpu_rank{self.rank_}")
-        self._profiler_step("mid_forward") 
         return self.__send_activations(data, model_data)
 
     def __process_tail_forward_and_backward(self):
@@ -676,7 +662,7 @@ class PipeExecutor(Executor):
         if getattr(message, "meta_tensor_", None) is not None:
             meta_bytes = bytes(message.meta_tensor_.cpu().tolist())
             buffer = io.BytesIO(meta_bytes)
-            model_data = torch.load(buffer)
+            model_data = torch.load(buffer, weights_only=False)
 
         data = RecvOperator.apply(
             torch.tensor(1.0, requires_grad=True, device=self.device_),
@@ -687,35 +673,38 @@ class PipeExecutor(Executor):
 
         data.requires_grad_()
 
-        torch.cuda.reset_peak_memory_stats(device=self.device_)
+        torch.cuda.reset_peak_memory_stats(device=torch.device(self.device_))
         data.grad_fn.pre_stage_fn = self.default_stream_.poll
+        self._mark_step_boundary()
+        fwd_start = torch.cuda.Event(enable_timing=True)
+        fwd_end   = torch.cuda.Event(enable_timing=True)
 
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-
-        start_event.record()
+        self._prof_start_if_needed()
+        fwd_start.record()
         data = self.__forward(data, model_data)
         data.retain_grad()
-        end_event.record()
+        fwd_end.record()
+        fwd_end.synchronize()
 
-        fwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+        fwd_peak_memory_mb = torch.cuda.max_memory_allocated(torch.device(self.device_)) / (1024 * 1024)
         logging.info(f"Forward pass peak memory (Rank {self.rank_}): {self._fmt_peak_with_pct(fwd_peak_memory_mb)}")
 
-        torch.cuda.synchronize()
-        latency_ms = start_event.elapsed_time(end_event)
-        logging.info(f"   Forward Pass Latency (Rank {self.rank_}): {latency_ms:.4f} ms")
+        fwd_ms = fwd_start.elapsed_time(fwd_end)
+        logging.info(f"   Forward Pass Latency (Rank {self.rank_}): {fwd_ms:.4f} ms")
+
 
         self.default_stream_.poll()
 
         labels = torch.tensor(model_data.batch_tokens_, dtype=torch.long, device=self.device_)
         masks = torch.tensor(model_data.batch_mask_, device=self.device_)
 
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
+        bwd_start = torch.cuda.Event(enable_timing=True)
+        bwd_end   = torch.cuda.Event(enable_timing=True)
 
-        torch.cuda.reset_peak_memory_stats(device=self.device_)
+        torch.cuda.reset_peak_memory_stats(device=torch.device(self.device_))
 
-        start_event.record()
+        # Record the start *before* any CUDA work you want to time
+        bwd_start.record()
 
         total_loss = None
         for config in model_data.data_config_:
@@ -725,26 +714,31 @@ class PipeExecutor(Executor):
             total_loss = loss if total_loss is None else total_loss + loss
 
         if total_loss is None:
+            self._prof_step_if_running()
+            self._prof_stop_if_running()
             logging.warning("tail: no loss computed")
             return
 
         logging.info(f"[Tail] computed loss {total_loss.item()}; calling backward()")
         total_loss.backward()
-        end_event.record()
 
+        self._prof_step_if_running()
+        self._prof_stop_if_running()
+
+        # Record the end *after* the CUDA work completes
+        bwd_end.record()
+        bwd_end.synchronize()  # fence for accurate timing
+
+        bwd_ms = bwd_start.elapsed_time(bwd_end)
+        logging.info(f"   Backward Pass Latency (Rank {self.rank_}): {bwd_ms:.4f} ms")
         if self.writer_ is not None:
-            self.writer_.add_scalar(f"loss/total_rank{self.rank_}", float(total_loss.item()), self.global_step_)
-            self.writer_.add_scalar(f"time/forward_ms_rank{self.rank_}", float(latency_ms), self.global_step_)
-            # GPU + memory (with percentages) to TB and logs
-            self._tb_log_gpu_now(f"gpu_rank{self.rank_}")
-        self._profiler_step("tail_backward")
+            self.writer_.add_scalar(f"loss/total_rank{self.rank_}", float(total_loss.item()), self.rank_step_)
+            self.writer_.add_scalar(f"time/forward_ms_rank{self.rank_}", float(fwd_ms), self.rank_step_)
+            self.writer_.add_scalar(f"time/backward_ms_rank{self.rank_}", float(bwd_ms), self.rank_step_)
 
-        bwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.device_) / (1024 * 1024)
+
+        bwd_peak_memory_mb = torch.cuda.max_memory_allocated(torch.device(self.device_)) / (1024 * 1024)
         logging.info(f"Backward pass peak memory (Rank {self.rank_}): {self._fmt_peak_with_pct(bwd_peak_memory_mb)}")
-
-        torch.cuda.synchronize()
-        latency_ms = start_event.elapsed_time(end_event)
-        logging.info(f"   Backward Pass Latency (Rank {self.rank_}): {latency_ms:.4f} ms")
 
         gradient_to_send = data.grad
         assert gradient_to_send is not None, "Input gradient is None after backward pass."
@@ -766,6 +760,10 @@ class PipeExecutor(Executor):
 
         for task_name in model_data.task_name_:
             self.dispatcher_.dispatch_task_to_step(task_name)
+        self._tb_log_gpu_now(f"gpu_rank{self.rank_}")
+        self.rank_step_ += 1
+
+
 
     def __handle_comm(self, comm_data):
         if comm_data["comm"] == "task_add":
@@ -823,9 +821,6 @@ class PipeExecutor(Executor):
         else:
             logging.warning("Batch produced no loss value.")
 
-        # snapshot after head forward/send path as well
-        self._tb_log_gpu_now(f"gpu_rank{self.rank_}")
-        self._profiler_step("head_output") 
 
     def __process_input(self):
         train_data: MLoRAData | None = self.dispatcher_.data()
@@ -838,17 +833,18 @@ class PipeExecutor(Executor):
             device=self.device_,
             requires_grad=False,
         )
-
+        if self.role_ == WorkerRole.HEAD:
+            self._mark_step_boundary()
+            self._prof_start_if_needed()
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
-
         start_event.record()
         self.latency_events_[train_data.model_data().random_id_] = start_event
 
         hidden_data = self.__forward(tensor_data, train_data.model_data())
 
         end_event.record()
-        torch.cuda.synchronize()
+        end_event.synchronize()
         latency_ms = start_event.elapsed_time(end_event)
         logging.info(f"    Head Node Forward Latency: {latency_ms:.4f} ms")
 
@@ -870,37 +866,42 @@ class PipeExecutor(Executor):
         self.input_cache_[train_data.model_data().random_id_] = train_data
         self.backward_cache_[int(train_data.model_data().random_id_)] = phony
 
-        # snapshot after head produces activations too
-        self._tb_log_gpu_now(f"gpu_rank{self.rank_}")
-        self._profiler_step("head_forward")
 
     def __send_activations(self, tensor_data: torch.Tensor, batch_data: ModelData):
-        ##FIXME
-        if self.next_rank == None:
+        if self.next_rank is None:
             return
 
-        assert isinstance(tensor_data, torch.Tensor)
-        assert batch_data is None or isinstance(batch_data, ModelData)
+        assert isinstance(tensor_data, torch.Tensor), "tensor_data must be a Tensor"
+        assert batch_data is not None and isinstance(batch_data, ModelData), "batch_data (ModelData) is required"
 
-        batch_random_id = batch_data.random_id_ if batch_data is not None else uuid.uuid4().int
-        rid = batch_random_id % (2**63 - 1)
+        # Serialize the full ModelData into bytes, then to a device tensor.
+        try:
+            buffer = io.BytesIO()
+            torch.save(batch_data, buffer)  # includes random_id_, task names, masks, etc.
+            buffer.seek(0)
+            meta_bytes = buffer.getvalue()
+            meta_tensor = torch.ByteTensor(list(meta_bytes)).to(self.device_)
+        except Exception as e:
+            raise RuntimeError(f"Failed to serialize ModelData for send: {e}")
 
+        # Build the message for the next stage.
         msg = PipeMessage(
-            PipeMessageType.TENSOR,
+            msg_type=PipeMessageType.TENSOR,
             tensor=tensor_data,
-            meta_tensor=torch.tensor([rid], dtype=torch.int64, device=self.device_),
-            comm_data=batch_data,
+            comm_data=None,           
+            meta_tensor=meta_tensor,   
         )
 
         phony: torch.Tensor = SendOperator.apply(
             torch.tensor(1.0, requires_grad=True, device=self.device_),
             self.transport_,
             msg,
-            "tail"
+            "mid"   
         )
 
-        tn = batch_data.task_name_[0] if batch_data is not None else "unknown"
-        self.backward_cache_[(tn, int(rid))] = phony
+        rid = int(batch_data.random_id_)
+        self.backward_cache_[rid] = phony
+
 
     def __send_comm(self, data: Any, dst: Optional[int] = None) -> None:
         if dst is None:
@@ -961,6 +962,8 @@ class PipeExecutor(Executor):
         return data[0]
 
     def execute(self) -> None:
+        # Also set device here defensively (harmless if already set)
+        torch.cuda.set_device(torch.device(self.device_))
         if self.role_ == WorkerRole.HEAD:
             self.__head_worker_run()
         elif self.role_ == WorkerRole.MID:
@@ -1028,6 +1031,21 @@ class PipeExecutor(Executor):
                     continue
                 partial_layer.wrapper_module_.offload_adapter(adapter_name)
         task.terminate()
+        try:
+            if hasattr(self, "_util_stop"):
+                self._util_stop.set()
+            if hasattr(self, "_util_thread"):
+                self._util_thread.join(timeout=1.0)
+            if self._nvml:
+                self._nvml["lib"].nvmlShutdown()
+        except Exception:
+            pass
+
+        # Stop profiler so traces flush cleanly to TB
+        if getattr(self, "_prof_running", False):
+            try: self.profiler_.stop()
+            except Exception: pass
+            finally: self._prof_running = False
 
     def __linears_info(self) -> OrderedDict[str, LinearInfo]:
         ret_val = OrderedDict()

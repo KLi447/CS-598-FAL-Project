@@ -48,14 +48,29 @@ class Executor:
         self.log_dir_ = os.path.join(base_logdir, f"host-{host}", f"rank{self.rank_}")
         os.makedirs(self.log_dir_, exist_ok=True)
 
+        self._nvml_handle = None
+        if _NVML_OK:
+            try:
+                idx = int(str(getattr(self.model_, "device_", "cuda:0")).split(":")[-1])
+            except Exception:
+                idx = 0
+            try:
+                pynvml.nvmlInit()
+                self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+                logging.info(f"[Rank {self.rank_}] NVML initialized for device {idx}")
+            except Exception as e:
+                logging.warning(f"[Rank {self.rank_}] NVML init failed: {e}")
+                self._nvml_handle = None
+
         self.writer_ = SummaryWriter(log_dir=self.log_dir_, filename_suffix=f"_rank{self.rank_}")
+        
 
         activities = [
             torch.profiler.ProfilerActivity.CPU,
             torch.profiler.ProfilerActivity.CUDA,
         ]
 
-        profiler_schedule = torch.profiler.schedule(wait=2, warmup=1, active=47, repeat=1)
+        profiler_schedule = torch.profiler.schedule(wait=2, warmup=1, active=4, repeat=1)
 
         self.profiler_ = torch.profiler.profile(
             activities=activities,
@@ -92,93 +107,61 @@ class Executor:
 
     def _tb_log_gpu_now(self, tag_prefix: str) -> Optional[float]:
         """
-        Push instantaneous GPU + memory stats to TensorBoard.
-        Mirrors the style from PipeExecutor:
-          - NVML GPU util %
-          - CUDA allocated/reserved bytes
-          - Allocated/Reserved as % of device total
-        Also flushes TB and increments global_step_.
-        Returns util% if available.
+        Push instantaneous GPU + memory stats to TensorBoard for the *current* step.
+        Does NOT mutate self.global_step_. Caller controls the step.
         """
         if self.writer_ is None:
             return None
-
         try:
             dev = torch.device(self.model_.device_)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize(dev)
+            mem_alloc = torch.cuda.memory_allocated(dev)
+            mem_resv  = torch.cuda.memory_reserved(dev)
+            device_total_bytes = self._device_total_bytes()
 
-                mem_alloc = torch.cuda.memory_allocated(dev)
-                mem_resv  = torch.cuda.memory_reserved(dev)
-                device_total_bytes = self._device_total_bytes()
-
-                util_now, nvml_used, nvml_total = None, None, None
-
-                # Try NVML (safe-guarded)
-                if _NVML_OK:
-                    try:
-                        pynvml.nvmlInit()
-                        # If device string is like "cuda:1", take the index
-                        try:
-                            idx = int(str(self.model_.device_).split(":")[-1])
-                        except Exception:
-                            idx = 0
-                        h = pynvml.nvmlDeviceGetHandleByIndex(idx)
-                        u = pynvml.nvmlDeviceGetUtilizationRates(h)
-                        util_now = float(u.gpu)
-                        meminfo = pynvml.nvmlDeviceGetMemoryInfo(h)
-                        nvml_used, nvml_total = float(meminfo.used), float(meminfo.total)
-                        pynvml.nvmlShutdown()
-                    except Exception:
-                        # NVML may not be available in some environments; just skip
-                        pass
-
-                step = self.global_step_
-
-                if util_now is not None:
-                    self.writer_.add_scalar(f"{tag_prefix}/gpu_util_pct", util_now, step)
-
-                # Raw CUDA memory (allocator perspective)
-                self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/allocated_bytes", mem_alloc, step)
-                self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/reserved_bytes",  mem_resv,  step)
-
-                # Normalize by device total, if available
-                if device_total_bytes > 0:
-                    self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/allocated_pct",
-                                            (mem_alloc / device_total_bytes) * 100.0, step)
-                    self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/reserved_pct",
-                                            (mem_resv / device_total_bytes) * 100.0, step)
-
-                # NVML device view (if present)
-                if nvml_used is not None and nvml_total:
-                    self.writer_.add_scalar(f"{tag_prefix}/nvml/device_used_bytes", nvml_used, step)
-                    self.writer_.add_scalar(f"{tag_prefix}/nvml/device_used_pct", (nvml_used / nvml_total) * 100.0, step)
-
-                # Also log a simple pipeline step marker to keep charts moving
-                self.writer_.add_scalar("pipeline/step", step, step)
-
-                # Flush immediately so TB frontend updates
-                self.writer_.flush()
-
-                # Bump step to ensure a new X-axis point next time
-                self.global_step_ += 1
-
-                # Emit a concise log line (like PipeExecutor)
-                total_b = device_total_bytes if device_total_bytes else 1
+            util_now = None
+            nvml_used = None
+            nvml_total = None
+            if _NVML_OK and self._nvml_handle is not None:
                 try:
-                    alloc_pct = (mem_alloc / total_b) * 100.0
-                    resv_pct  = (mem_resv  / total_b) * 100.0
+                    u = pynvml.nvmlDeviceGetUtilizationRates(self._nvml_handle)
+                    util_now = float(u.gpu)
+                    meminfo = pynvml.nvmlDeviceGetMemoryInfo(self._nvml_handle)
+                    nvml_used, nvml_total = float(meminfo.used), float(meminfo.total)
                 except Exception:
-                    alloc_pct = resv_pct = 0.0
-                logging.info(
-                    f"[Rank {self.rank_}] step {step} | GPU util={util_now}% "
-                    f"| alloc={mem_alloc/1e6:.1f}MB ({alloc_pct:.1f}%) "
-                    f"| reserved={mem_resv/1e6:.1f}MB ({resv_pct:.1f}%)"
-                )
-                return util_now
+                    pass
+
+            step = self.global_step_  # <-- single source of truth
+
+            if util_now is not None:
+                self.writer_.add_scalar(f"{tag_prefix}/gpu_util_pct", util_now, step)
+
+            self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/allocated_bytes", mem_alloc, step)
+            self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/reserved_bytes",  mem_resv,  step)
+
+            if device_total_bytes > 0:
+                self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/allocated_pct",
+                                        (mem_alloc / device_total_bytes) * 100.0, step)
+                self.writer_.add_scalar(f"{tag_prefix}/cuda_mem/reserved_pct",
+                                        (mem_resv / device_total_bytes) * 100.0, step)
+
+            if nvml_used is not None and nvml_total:
+                self.writer_.add_scalar(f"{tag_prefix}/nvml/device_used_bytes", nvml_used, step)
+                self.writer_.add_scalar(f"{tag_prefix}/nvml/device_used_pct",
+                                        (nvml_used / nvml_total) * 100.0, step)
+
+            # A simple heartbeat so charts always advance alongside step
+            self.writer_.add_scalar("pipeline/step", step, step)
+            self.writer_.flush()
+
+            logging.info(
+                f"[Rank {self.rank_}] step {step} | GPU util={util_now}% "
+                f"| alloc={mem_alloc/1e6:.1f}MB | reserved={mem_resv/1e6:.1f}MB"
+            )
+            return util_now
         except Exception as e:
             logging.warning(f"TB GPU log failed: {e}")
-        return None
+            return None
+
 
     def _profiler_step(self, where: str):
         """Advance profiler & write a simple tag (kept lightweight like in PipeExecutor)."""
@@ -277,8 +260,8 @@ class Executor:
                 self.writer_.add_scalar("time/forward_ms", float(fwd_latency_ms), self.global_step_)
 
             # --- NEW: GPU/memory snapshot after forward (same style as PipeExecutor) ---
-            self._tb_log_gpu_now(f"gpu_rank{self.rank_}")
-            self._profiler_step("forward")
+            torch.cuda.synchronize()
+            self._tb_log_gpu_now(f"gpu_rank{self.rank_}_fwd")
 
             total_loss: Optional[torch.Tensor] = None
 
@@ -300,8 +283,6 @@ class Executor:
 
                 total_loss.backward()
 
-                # Keep profiler step, but we also call _profiler_step() to mirror PipeExecutor semantics
-                self.profiler_.step()
                 bwd_end_event.record()
 
                 bwd_peak_memory_mb = torch.cuda.max_memory_allocated(self.model_.device_) / (1024 * 1024)
@@ -321,21 +302,25 @@ class Executor:
                         torch.cuda.max_memory_allocated(device=self.model_.device_),
                         self.global_step_,
                     )
+                torch.cuda.synchronize()
+                self._tb_log_gpu_now(f"gpu_rank{self.rank_}_bwd")
 
-                # --- NEW: GPU/memory snapshot after backward (same style as PipeExecutor) ---
-                self._tb_log_gpu_now(f"gpu_rank{self.rank_}")
-                self._profiler_step("backward")
             else:
                 # Still keep charts moving if no loss was produced
-                self._tb_log_gpu_now(f"gpu_rank{self.rank_}")
-                self._profiler_step("no_loss_step")
+                torch.cuda.synchronize()
+                self._tb_log_gpu_now(f"gpu_rank{self.rank_}_bwd")
 
             self.dispatcher_.step()
             mm_collect_step += 1
             if self.writer_:
                 self.writer_.flush()
+            self.global_step_ += 1 
 
-            # Note: self.global_step_ is incremented inside _tb_log_gpu_now()
+            try:
+                if self.profiler_ is not None:
+                    self.profiler_.step()
+            except Exception:
+                pass
 
             mlora.profiler.metric_log_dict(
                 "memory",
