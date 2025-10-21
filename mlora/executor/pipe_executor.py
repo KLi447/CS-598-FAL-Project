@@ -96,13 +96,6 @@ class PipeExecutor(Executor):
             PipeDispatcher, DISPATCHER_CLASS["pipe"](config.dispatcher_)
         )
 
-        self.logger_ = logging.getLogger(f"PipeExecutor-{self.rank_}")
-        file_handler = logging.FileHandler(f"worker_{self.rank_}_metrics.log")
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        self.logger_.addHandler(file_handler)
-        self.logger_.setLevel(logging.INFO)
-
         self.gpu_monitoring_thread_ = threading.Thread(
             target=self.__monitor_gpu_utilization, daemon=True
         )
@@ -176,7 +169,7 @@ class PipeExecutor(Executor):
                 if output:
                     gpu_util, mem_used, mem_total = map(int, output.split(","))
                     mem_percent = (mem_used / mem_total) * 100
-                    self.logger_.info(
+                    logging.info(
                         f"[GPU{device_index}] GPU Utilization: {gpu_util}% | "
                         f"Memory Used: {mem_used}MB / {mem_total}MB ({mem_percent:.1f}%)"
                     )
