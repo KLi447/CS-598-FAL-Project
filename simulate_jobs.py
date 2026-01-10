@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 import yaml
 import os
+import shutil
 import pynvml
 import subprocess
 import selectors
@@ -492,6 +493,10 @@ class WorkloadExecutor:
         return command
     
     def execute_calibration_run(self, group_id, group_df, scheduled_time):
+        try:
+            shutil.rmtree("/users/KLi44/CS-598-FAL-Project/adapters")
+        except:
+            pass
         if scheduled_time > self.simulation_time:
             time_skip = scheduled_time - self.simulation_time
             print(f"\n[Simulated time skip: {time_skip:.2f}s]")
@@ -574,6 +579,7 @@ class WorkloadExecutor:
                     
                     process.wait()
                     os.killpg(process.pid, signal.SIGKILL)
+                    os.rmdir("adapters/")
             
             calibration_time = time.time() - wall_start
             print(f"  {'='*50}")
