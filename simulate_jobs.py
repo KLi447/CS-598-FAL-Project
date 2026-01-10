@@ -72,7 +72,7 @@ class GPUMonitor(threading.Thread):
         return pd.DataFrame(data)
 
 def process_gpu_trace(input_csv, output_dir="lora_configs", random_seed=42, 
-                     arrival_scale=1.0, month=None):
+                     arrival_scale=1.0, month=None, max_jobs=None):
     np.random.seed(random_seed)
 
     df = pd.read_csv(input_csv)
@@ -93,6 +93,10 @@ def process_gpu_trace(input_csv, output_dir="lora_configs", random_seed=42,
     df['relative_start_time'] = (df['submit_time'] - earliest_time).dt.total_seconds()
     df['relative_start_time'] = df['relative_start_time'] * arrival_scale
     df = df.sort_values('relative_start_time').reset_index(drop=True)
+
+    if max_jobs and len(df) > max_jobs:
+        df = df.iloc[:max_jobs].copy()
+        print(f"Limiting simulation to first {max_jobs} jobs")
 
     def categorize_job(gpu_count):
         if gpu_count == 1:
@@ -132,9 +136,9 @@ def process_gpu_trace(input_csv, output_dir="lora_configs", random_seed=42,
 
     def assign_num_epochs(category):
         epochs = {
-            'Light': [2, 3],
-            'Medium': [5, 8],
-            'Heavy': [10, 20]
+            'Light': [3, 5, 10],
+            'Medium': [15, 25, 30],
+            'Heavy': [50, 75, 100]
         }
         return np.random.choice(epochs[category])
 
@@ -298,11 +302,10 @@ def create_yaml_configs(df, output_dir):
         with open(output_file, 'w') as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
     
-    print(f"Generated {df['group_id'].nunique()} YAML configuration files (one per group)")
+    print(f"Generated {df['group_id'].nunique()} YAML configuration files")
 
 
 def get_model_type(base_model):
-    """Extract model type from base model name."""
     if 'llama' in base_model.lower():
         return 'llama'
     elif 'qwen' in base_model.lower():
@@ -321,7 +324,7 @@ def get_full_model_path(base_model):
 
 
 def get_balance_config(base_model, total_gpus):    
-    total_layers = 39 if base_model == "Qwen/Qwen3-8B" else 35
+    total_layers = 39 if base_model == "qwen-3-8b" else 35
 
     layers_per_gpu = total_layers // total_gpus
     remainder = total_layers % total_gpus
@@ -335,18 +338,132 @@ def get_balance_config(base_model, total_gpus):
 
 
 class WorkloadExecutor:    
-    def __init__(self, df, config_dir, total_gpus=4):
+    def __init__(self, df, config_dir, total_gpus=4, max_runtime_per_group=20):
         self.df = df
         self.config_dir = config_dir
         self.total_gpus = total_gpus
-
+        self.max_runtime_per_group = max_runtime_per_group
+        
         self.job_metrics = []
-        self.gpu_usage_timeline = []
         self.simulation_time = 0.0
         self.wall_clock_start = None
-
-        self.monitor = GPUMonitor(interval=1.0)
+        self.monitor = GPUMonitor(1.0)
         
+    def create_minimal_config(self, group_df, config_path):
+        adapters = []
+        tasks = []
+        
+        base_model = group_df.iloc[0]['base_model']
+        
+        for idx, job in group_df.iterrows():
+            job_id = job['job_id']
+            lora_name = f"lora_{job_id}"
+            
+            adapter = {
+                'name': lora_name,
+                'type': 'lora',
+                'path': f'adapters/lora_sft_{job_id}',
+                'optimizer': 'adamw',
+                'lr': 1e-5,
+                'r': int(job['lora_rank']),
+                'alpha': int(job['lora_rank'] * 2),
+                'dropout': 0.05,
+                'target_modules': {
+                    'q_proj': True,
+                    'k_proj': True,
+                    'v_proj': True,
+                    'o_proj': True,
+                    'gate_proj': False,
+                    'down_proj': False,
+                    'up_proj': False
+                }
+            }
+            adapters.append(adapter)
+
+            task = {
+                'type': 'train',
+                'name': f'task_{job_id}',
+                'adapter': lora_name,
+                'dataset': 'gsm8k',
+                'batch_size': int(job['batch_size']),
+                'mini_batch_size': int(job['batch_size']),
+                'num_epochs': 1,
+                'cutoff_len': 2048,
+                'save_step': 999999999
+            }
+            tasks.append(task)
+        
+        config = {
+            'dispatcher': {
+                'name': 'default',
+                'concurrency_num': len(group_df)
+            },
+            'datasets': [
+                {
+                    'name': 'gsm8k',
+                    'data': 'demo/gsm8k.json',
+                    'prompt': 'demo/prompt.yaml',
+                    'prompt_type': 'instruction',
+                    'preprocess': 'shuffle'
+                }
+            ],
+            'adapters': adapters,
+            'tasks': tasks
+        }
+        
+        output_file = os.path.join(config_path)
+        with open(output_file, 'w') as f:
+            yaml.dump(config, f, default_flow_style=False, sort_keys=False)
+    
+    def parse_log_timing(self, log_file, group_df):
+        if not os.path.exists(log_file):
+            return None
+        
+        with open(log_file, 'r') as f:
+            log_content = f.read()
+        
+        adapter_times = {}
+
+        for idx, job in group_df.iterrows():
+            job_id = job['job_id']
+            lora_name = f"lora_{job_id}"
+
+            pattern = rf'\[(\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}}),\d+\] m-LoRA: .*{lora_name}'
+            matches = re.findall(pattern, log_content)
+            
+            if len(matches) >= 2:
+                timestamps = [datetime.strptime(ts, '%Y-%m-%d %H:%M:%S') for ts in matches]
+
+                load_pattern = rf'\[(\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}}),\d+\] m-LoRA: Task to running, need to load adapters: \[.*{lora_name}.*\]'
+                offload_pattern = rf'\[(\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}}),\d+\] m-LoRA: Finish and base model offload adapter - \[.*{lora_name}.*\]'
+                
+                load_match = re.search(load_pattern, log_content)
+                offload_match = re.search(offload_pattern, log_content)
+                
+                if load_match and offload_match:
+                    load_time = datetime.strptime(load_match.group(1), '%Y-%m-%d %H:%M:%S')
+                    offload_time = datetime.strptime(offload_match.group(1), '%Y-%m-%d %H:%M:%S')
+
+                    epoch_time = (offload_time - load_time).total_seconds()
+                    adapter_times[job_id] = epoch_time
+                    
+                    print(f"  {lora_name}: {epoch_time:.2f}s per epoch")
+        
+        return adapter_times if adapter_times else None
+    
+    def estimate_group_runtime(self, group_df, adapter_times):
+        max_time = 0
+        
+        for idx, job in group_df.iterrows():
+            job_id = job['job_id']
+            num_epochs = job['num_epochs']
+            
+            if job_id in adapter_times:
+                total_time = adapter_times[job_id] * num_epochs * math.ceil(7473/128) # scale up by epochs and full dataset size
+                max_time = max(max_time, total_time)
+        
+        return max_time
+    
     def generate_command(self, group_df, config_path):
         total_gpus = int(group_df['scaled_gpu_count'].sum())
         base_model = group_df.iloc[0]['base_model']
@@ -365,9 +482,8 @@ class WorkloadExecutor:
             '--recompute',
             '--balance'
         ]
-
+        
         command.extend(balance.split())
-
         command.extend([
             '--precision', 'fp16',
             '--model_type', model_type
@@ -375,30 +491,34 @@ class WorkloadExecutor:
         
         return command
     
-    def execute_job(self, group_id, group_df, scheduled_time):
+    def execute_calibration_run(self, group_id, group_df, scheduled_time):
         if scheduled_time > self.simulation_time:
             time_skip = scheduled_time - self.simulation_time
             print(f"\n[Simulated time skip: {time_skip:.2f}s]")
             self.simulation_time = scheduled_time
-
+        
         actual_start = self.simulation_time
         gpus_used = int(group_df['scaled_gpu_count'].sum())
         
-        print(f"\n[t={actual_start:.2f}s] Starting Group {group_id}")
+        print(f"\n{'='*60}")
+        print(f"[t={actual_start:.2f}s] Starting Group {group_id}")
         print(f"  Model: {group_df.iloc[0]['base_model']}")
         print(f"  Adapters: {len(group_df)}")
         print(f"  GPUs: {gpus_used}")
+        print(f"  Running calibration (1 epoch)...")
 
-        config_path = os.path.join(self.config_dir, f"group_{group_id}.yaml")
+        config_path = os.path.join(self.config_dir, f"group_{group_id}_calibrate.yaml")
+        self.create_minimal_config(group_df, config_path)
+        
         command = self.generate_command(group_df, config_path)
-
+        
+        log_dir = os.path.join(self.config_dir, "logs")
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        log_file = os.path.join(log_dir, f"group_{group_id}_calibrate.log")
+        
         wall_start = time.time()
         
         try:
-            log_dir = os.path.join(self.config_dir, "logs")
-            Path(log_dir).mkdir(parents=True, exist_ok=True)
-            log_file = os.path.join(log_dir, f"group_{group_id}.log")
-
             with open(log_file, 'w') as f:
                 process = subprocess.Popen(
                     command,
@@ -412,18 +532,21 @@ class WorkloadExecutor:
                 
                 print(f"  Logging to: {log_file}")
                 print(f"  {'='*50}")
+                
+                import selectors
+                import signal
                 selector = selectors.DefaultSelector()
                 selector.register(process.stdout, selectors.EVENT_READ)
-
+                
                 try:
                     while True:
-                        events = selector.select(timeout=180)
-
+                        events = selector.select(timeout=20)
+                        
                         if not events:
-                            print(f"\n  [!] No output for 180 seconds. Killing process group_{group_id}...")
+                            print(f"\n  [!] No output for 20 seconds. Killing process group_{group_id}...")
                             os.killpg(os.getpgid(process.pid), signal.SIGKILL)
                             break
-
+                        
                         if events:
                             line = process.stdout.readline()
                             if not line:
@@ -431,84 +554,109 @@ class WorkloadExecutor:
                             f.write(line)
                             f.flush()
                             print(f"  [{group_id}] {line.rstrip()}")
-
+                
                 finally:
                     selector.close()
                     
                     cmd = "nvidia-smi --query-compute-apps=pid --format=csv,noheader"
                     output = subprocess.check_output(cmd, shell=True, encoding='utf-8')
-
+                    
                     pids_str = output.strip().split('\n')
                     pids = [int(p.strip()) for p in pids_str if p.strip()]
-
+                    
                     print(f"Found PIDs: {pids}")
-
+                    
                     for pid in pids:
                         try:
                             os.kill(pid, signal.SIGKILL)
                         except:
                             pass
-
+                    
                     process.wait()
                     os.killpg(process.pid, signal.SIGKILL)
-
-            wall_completion_time = time.time() - wall_start
-
-            self.simulation_time += wall_completion_time
-            actual_end = self.simulation_time
             
+            calibration_time = time.time() - wall_start
             print(f"  {'='*50}")
-            print(f"[t={actual_end:.2f}s] Completed Group {group_id} (duration: {wall_completion_time:.2f}s)")
+            print(f"  Calibration completed in {calibration_time:.2f}s")
 
-            self.job_metrics.append({
-                'group_id': group_id,
-                'scheduled_time': scheduled_time,
-                'actual_start': actual_start,
-                'actual_end': actual_end,
-                'completion_time': wall_completion_time,
-                'gpus_used': gpus_used,
-                'num_adapters': len(group_df),
-                'base_model': group_df.iloc[0]['base_model'],
-                'status': 'completed' if process.returncode == 0 else 'failed',
-                'return_code': process.returncode,
-                'log_file': log_file
-            })
+            print(f"  Parsing timing information...")
+            adapter_times = self.parse_log_timing(log_file, group_df)
             
-            if process.returncode != 0:
-                print(f"  ERROR: Job failed with return code {process.returncode}")
-                print(f"  Check log file: {log_file}")
-            
+            if adapter_times:
+                estimated_runtime = self.estimate_group_runtime(group_df, adapter_times)
+                print(f"  Estimated full runtime: {estimated_runtime:.2f}s")
+
+                self.simulation_time += estimated_runtime
+                actual_end = self.simulation_time
+                
+                print(f"  {'='*50}")
+                print(f"[t={actual_end:.2f}s] Completed Group {group_id}")
+                print(f"  Simulated duration: {estimated_runtime:.2f}s")
+                print(f"  Wall clock time: {calibration_time:.2f}s")
+                print(f"  Speedup: {estimated_runtime/calibration_time:.2f}x")
+
+                self.job_metrics.append({
+                    'group_id': group_id,
+                    'scheduled_time': scheduled_time,
+                    'actual_start': actual_start,
+                    'actual_end': actual_end,
+                    'completion_time': estimated_runtime,
+                    'calibration_time': calibration_time,
+                    'gpus_used': gpus_used,
+                    'num_adapters': len(group_df),
+                    'base_model': group_df.iloc[0]['base_model'],
+                    'status': 'simulated',
+                    'adapter_times': adapter_times,
+                    'log_file': log_file
+                })
+                
+            else:
+                self.simulation_time += calibration_time
+                
+                self.job_metrics.append({
+                    'group_id': group_id,
+                    'scheduled_time': scheduled_time,
+                    'actual_start': actual_start,
+                    'actual_end': self.simulation_time,
+                    'completion_time': calibration_time,
+                    'calibration_time': calibration_time,
+                    'gpus_used': gpus_used,
+                    'num_adapters': len(group_df),
+                    'base_model': group_df.iloc[0]['base_model'],
+                    'status': 'fallback',
+                    'log_file': log_file
+                })
+                
         except Exception as e:
             print(f"  ERROR executing group {group_id}: {e}")
             import traceback
             traceback.print_exc()
-
-            wall_completion_time = time.time() - wall_start
-            self.simulation_time += wall_completion_time
-            actual_end = self.simulation_time
+            
+            wall_time = time.time() - wall_start
+            self.simulation_time += wall_time
             
             self.job_metrics.append({
                 'group_id': group_id,
                 'scheduled_time': scheduled_time,
                 'actual_start': actual_start,
-                'actual_end': actual_end,
-                'completion_time': wall_completion_time,
+                'actual_end': self.simulation_time,
+                'completion_time': wall_time,
+                'calibration_time': wall_time,
                 'gpus_used': gpus_used,
                 'num_adapters': len(group_df),
                 'base_model': group_df.iloc[0]['base_model'],
                 'status': 'error',
-                'return_code': -1,
-                'log_file': None
+                'log_file': log_file
             })
     
     def execute_workload(self):
         print("\n" + "="*60)
-        print("STARTING WORKLOAD EXECUTION")
+        print("STARTING WORKLOAD SIMULATION")
         print("="*60)
         
         self.wall_clock_start = time.time()
         self.simulation_time = 0.0
-
+        
         group_info = self.df.groupby('group_id').agg({
             'relative_start_time': 'min',
             'base_model': 'first',
@@ -517,12 +665,13 @@ class WorkloadExecutor:
         group_info = group_info.sort_values('relative_start_time')
 
         self.monitor.start()
+
         for _, group in group_info.iterrows():
             group_id = group['group_id']
             scheduled_time = group['relative_start_time']
             group_df = self.df[self.df['group_id'] == group_id]
             
-            self.execute_job(group_id, group_df, scheduled_time)
+            self.execute_calibration_run(group_id, group_df, scheduled_time)
 
         self.monitor.stop()
         self.monitor.join()
@@ -531,11 +680,12 @@ class WorkloadExecutor:
         total_wall_time = wall_clock_end - self.wall_clock_start
         
         print("\n" + "="*60)
-        print("WORKLOAD EXECUTION COMPLETED")
+        print("WORKLOAD SIMULATION COMPLETED")
         print("="*60)
         print(f"Simulated time: {self.simulation_time:.2f}s ({self.simulation_time/3600:.2f} hours)")
         print(f"Wall clock time: {total_wall_time:.2f}s ({total_wall_time/3600:.2f} hours)")
-        print(f"Speedup: {self.simulation_time/total_wall_time:.2f}x")
+        print(f"Overall speedup: {self.simulation_time/total_wall_time:.2f}x")
+        
         self.calculate_metrics()
     
     def calculate_metrics(self):
@@ -547,12 +697,11 @@ class WorkloadExecutor:
         
         total_simulated_time = self.simulation_time
         total_wall_time = time.time() - self.wall_clock_start
-        completed_jobs = metrics_df[metrics_df['status'] == 'completed']
 
         hw_metrics = self.monitor.get_metrics_df()
         
         print("\n" + "="*60)
-        print("GPU UTILIZATION")
+        print("HARDWARE UTILIZATION (Real-time)")
         print("="*60)
         
         if not hw_metrics.empty:
@@ -578,64 +727,38 @@ class WorkloadExecutor:
         print("\n" + "="*60)
         print("EXECUTION METRICS")
         print("="*60)
-
+        
         print(f"\nJob Completion:")
-        print(f"  Total jobs: {len(metrics_df)}")
-        print(f"  Completed: {len(completed_jobs)}")
-        print(f"  Failed: {len(metrics_df[metrics_df['status'] == 'failed'])}")
+        print(f"  Total groups: {len(metrics_df)}")
+        print(f"  Simulated: {len(metrics_df[metrics_df['status'] == 'simulated'])}")
+        print(f"  Fallback: {len(metrics_df[metrics_df['status'] == 'fallback'])}")
         print(f"  Errors: {len(metrics_df[metrics_df['status'] == 'error'])}")
         
-        if len(completed_jobs) > 0:
-            print(f"\nCompletion Time Statistics:")
-            print(f"  Mean: {completed_jobs['completion_time'].mean():.2f}s")
-            print(f"  Median: {completed_jobs['completion_time'].median():.2f}s")
-            print(f"  Min: {completed_jobs['completion_time'].min():.2f}s")
-            print(f"  Max: {completed_jobs['completion_time'].max():.2f}s")
-            print(f"  Std Dev: {completed_jobs['completion_time'].std():.2f}s")
-
+        completed = metrics_df[metrics_df['status'].isin(['simulated', 'fallback'])]
+        
+        if len(completed) > 0:
+            print(f"\nSimulated Completion Time Statistics:")
+            print(f"  Mean: {completed['completion_time'].mean():.2f}s")
+            print(f"  Median: {completed['completion_time'].median():.2f}s")
+            print(f"  Min: {completed['completion_time'].min():.2f}s")
+            print(f"  Max: {completed['completion_time'].max():.2f}s")
+            
+            print(f"\nCalibration Time Statistics:")
+            print(f"  Mean: {completed['calibration_time'].mean():.2f}s")
+            print(f"  Median: {completed['calibration_time'].median():.2f}s")
+            
+            print(f"\nAverage Speedup per Group:")
+            speedups = completed['completion_time'] / completed['calibration_time']
+            print(f"  Mean: {speedups.mean():.2f}x")
+            print(f"  Median: {speedups.median():.2f}x")
+        
         print(f"\nThroughput (Simulated Time):")
         print(f"  Total simulated time: {total_simulated_time:.2f}s ({total_simulated_time/3600:.2f} hours)")
         if total_simulated_time > 0:
-            print(f"  Jobs per hour: {len(completed_jobs) / (total_simulated_time/3600):.2f}")
-            print(f"  Adapters per hour: {completed_jobs['num_adapters'].sum() / (total_simulated_time/3600):.2f}")
+            print(f"  Groups per hour: {len(completed) / (total_simulated_time/3600):.2f}")
+            print(f"  Adapters per hour: {completed['num_adapters'].sum() / (total_simulated_time/3600):.2f}")
 
-        print(f"\nThroughput (Wall Clock Time):")
-        print(f"  Total wall clock time: {total_wall_time:.2f}s ({total_wall_time/3600:.2f} hours)")
-        if total_wall_time > 0:
-            print(f"  Jobs per hour: {len(completed_jobs) / (total_wall_time/3600):.2f}")
-            print(f"  Adapters per hour: {completed_jobs['num_adapters'].sum() / (total_wall_time/3600):.2f}")
-
-        total_job_time = completed_jobs['completion_time'].sum()
-        idle_time = total_simulated_time - total_job_time
-        if total_simulated_time > 0:
-            print(f"  Total job execution time: {total_job_time:.2f}s")
-            print(f"  Total idle time: {idle_time:.2f}s ({idle_time/total_simulated_time*100:.2f}%)")
-
-        if len(completed_jobs) > 0:
-            print(f"\nBy Job Category:")
-            category_stats = self.df.merge(
-                metrics_df[['group_id', 'completion_time']], 
-                on='group_id'
-            )
-            for category in ['Light', 'Medium', 'Heavy']:
-                cat_jobs = category_stats[category_stats['job_category'] == category]
-                if len(cat_jobs) > 0:
-                    print(f"  {category}:")
-                    print(f"    Count: {len(cat_jobs)}")
-                    print(f"    Avg completion: {cat_jobs['completion_time'].mean():.2f}s")
-
-        total_time_skipped = 0
-        for i, row in metrics_df.iterrows():
-            if row['scheduled_time'] > (metrics_df.iloc[i-1]['actual_end'] if i > 0 else 0):
-                time_skipped = row['scheduled_time'] - (metrics_df.iloc[i-1]['actual_end'] if i > 0 else 0)
-                total_time_skipped += time_skipped
-        
-        print(f"\nTime Skip Analysis:")
-        print(f"  Total time skipped: {total_time_skipped:.2f}s ({total_time_skipped/3600:.2f} hours)")
-        if total_simulated_time > 0:
-            print(f"  Percentage of simulated time: {total_time_skipped/total_simulated_time*100:.2f}%")
-
-        metrics_path = os.path.join(self.config_dir, "execution_metrics.csv")
+        metrics_path = os.path.join(self.config_dir, "simulation_metrics.csv")
         metrics_df.to_csv(metrics_path, index=False)
         print(f"\nDetailed metrics saved to: {metrics_path}")
 
@@ -652,7 +775,8 @@ if __name__ == "__main__":
         output_dir=config_dir,
         random_seed=seed,
         arrival_scale=arrival_scale,
-        month=month
+        month=month,
+        max_jobs=1000
     )
     
     if processed_df is not None:

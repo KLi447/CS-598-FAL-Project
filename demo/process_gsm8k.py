@@ -35,7 +35,7 @@ for example in dataset:
     entries.append(entry)
 
 with open("gsm8k.json", "w") as f:
-    for entry in entries:
+    for entry in entries[:128]:
         f.write(json.dumps(entry) + "\n")
 
 print(f"Saved {len(entries)} entries to gsm8k.json")
