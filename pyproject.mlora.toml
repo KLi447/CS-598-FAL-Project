@@ -21,6 +21,7 @@ dependencies = [
     "scipy==1.11.4",
     "tensorboard==2.17.0",
     "python-multipart==0.0.17",
+    "pyarrow==19.0.1"
 ]
 
 [project.optional-dependencies]

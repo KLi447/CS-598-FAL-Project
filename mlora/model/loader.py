@@ -49,10 +49,6 @@ def load_partial_model(args) -> LLMModel:
     seq_model = model.sequential()
     num_layers = len(seq_model)
 
-    balance = [num_layers // args.nodes] * args.nodes
-    for i in range(num_layers % args.nodes):
-        balance[i] += 1
-
     partial_model_to_device = [
         index + sum(args.balance[: args.rank])
         for index in range(0, args.balance[args.rank])
