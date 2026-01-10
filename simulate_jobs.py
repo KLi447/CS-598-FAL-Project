@@ -132,9 +132,9 @@ def process_gpu_trace(input_csv, output_dir="lora_configs", random_seed=42,
 
     def assign_num_epochs(category):
         epochs = {
-            'Light': [5, 10],
-            'Medium': [25, 50],
-            'Heavy': [50, 100]
+            'Light': [2, 3],
+            'Medium': [5, 8],
+            'Heavy': [10, 20]
         }
         return np.random.choice(epochs[category])
 
